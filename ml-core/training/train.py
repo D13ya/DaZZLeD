@@ -22,23 +22,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 class FlatImageDataset(Dataset):
     def __init__(self, root, transform, list_file=None, max_images=None, seed=0, cache_ram=False):
-        if list_file:
-            base = Path(list_file).resolve().parent
-            raw_paths = [p.strip() for p in Path(list_file).read_text().splitlines() if p.strip()]
-            self.paths = []
-            for p in raw_paths:
-                path = Path(p)
-                if not path.is_absolute():
-                    path = (base / path).resolve()
-                self.paths.append(path)
-        else:
-            self.paths = [
-                p for p in Path(root).rglob("*")
-                if p.suffix.lower() in IMAGE_EXTS
-            ]
-        if not self.paths:
-            source = list_file or root
-            raise ValueError(f"No images found under {source}")
+        self.paths = self._load_paths(root, list_file)
         if max_images and max_images > 0 and len(self.paths) > max_images:
             rng = random.Random(seed)
             rng.shuffle(self.paths)
@@ -49,18 +33,46 @@ class FlatImageDataset(Dataset):
         self.images = [None] * len(self.paths)
         
         if self.cache_ram:
-            print(f"Loading {len(self.paths)} images into RAM...")
-            # Detect excessive memory usage risk
-            is_windows = sys.platform.startswith('win')
-            if is_windows:
-                print("⚠️ Warning: --cache-ram on Windows duplicates memory per worker. Consider --workers 0 if OOM occurs.")
-            
-            from tqdm import tqdm
-            for i, p in enumerate(tqdm(self.paths, desc="Caching")):
-                # Store as decoded RGB to save decoding time during training
-                with Image.open(p) as img:
-                    self.images[i] = img.convert("RGB")
-            print("Finished caching.")
+            self._cache_images()
+
+    def _load_paths(self, root, list_file):
+        """Load image paths from list file or directory scan."""
+        if list_file:
+            return self._load_from_list_file(list_file)
+        return self._scan_directory(root)
+
+    def _load_from_list_file(self, list_file):
+        """Load paths from a text file."""
+        base = Path(list_file).resolve().parent
+        raw_paths = [p.strip() for p in Path(list_file).read_text().splitlines() if p.strip()]
+        paths = []
+        for p in raw_paths:
+            path = Path(p)
+            if not path.is_absolute():
+                path = (base / path).resolve()
+            paths.append(path)
+        if not paths:
+            raise ValueError(f"No images found in {list_file}")
+        return paths
+
+    def _scan_directory(self, root):
+        """Scan directory for image files."""
+        paths = [p for p in Path(root).rglob("*") if p.suffix.lower() in IMAGE_EXTS]
+        if not paths:
+            raise ValueError(f"No images found under {root}")
+        return paths
+
+    def _cache_images(self):
+        """Load all images into RAM."""
+        print(f"Loading {len(self.paths)} images into RAM...")
+        if sys.platform.startswith('win'):
+            print("⚠️ Warning: --cache-ram on Windows duplicates memory per worker. Consider --workers 0 if OOM occurs.")
+        
+        from tqdm import tqdm
+        for i, p in enumerate(tqdm(self.paths, desc="Caching")):
+            with Image.open(p) as img:
+                self.images[i] = img.convert("RGB")
+        print("Finished caching.")
 
     def __len__(self):
         return len(self.paths)
@@ -94,17 +106,17 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    set_seed(args.seed)
-
+def _configure_cuda_optimizations(args, device):
+    """Configure CUDA-specific optimizations."""
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     if args.cudnn_benchmark and device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    transform = build_transforms(args.image_size)
+
+def _create_dataloader(args, transform):
+    """Create the training data loader."""
     dataset = FlatImageDataset(
         args.data,
         transform,
@@ -113,76 +125,114 @@ def train(args):
         seed=args.seed,
         cache_ram=args.cache_ram,
     )
-    loader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
-        pin_memory=args.pin_memory and device.type == "cuda",
+        pin_memory=args.pin_memory,
         persistent_workers=args.workers > 0,
         prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
     )
 
+
+def _create_models(args, device):
+    """Create teacher and student models."""
     teacher = AutoModel.from_pretrained(args.teacher, trust_remote_code=True).to(device)
     teacher.eval()
 
     student = RecursiveHasher(state_dim=args.state_dim, hash_dim=args.hash_dim).to(device)
     if args.channels_last and device.type == "cuda":
         student = student.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
-
+    
     if args.resume:
         safetensors.torch.load_model(student, args.resume)
+    
+    return teacher, student
+
+
+def _save_checkpoint(student, checkpoint_dir, name):
+    """Save a model checkpoint."""
+    ckpt_path = Path(checkpoint_dir)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    out = ckpt_path / name
+    safetensors.torch.save_model(student, out.as_posix())
+
+
+def _train_step(images, teacher, student, args, device):
+    """Run a single training step and return the loss."""
+    use_amp = args.amp and device.type == "cuda"
+    
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            teacher_out = teacher(images)
+            target = F.normalize(teacher_out.last_hidden_state[:, 0], dim=1)
+
+    state = torch.zeros(images.size(0), args.state_dim, device=device)
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        for _ in range(args.recursion_steps):
+            state, student_hash = student(images, state)
+        loss = 1.0 - F.cosine_similarity(student_hash, target).mean()
+        loss = loss / args.grad_accum
+
+    return loss
+
+
+def _train_epoch(epoch, loader, teacher, student, optimizer, scaler, args, device, global_step):
+    """Run training for one epoch and return updated global_step."""
+    student.train()
+    total_loss = 0.0
+    
+    for step, images in enumerate(loader, start=1):
+        images = images.to(device, non_blocking=True)
+        if args.channels_last and images.dim() == 4:
+            images = images.contiguous(memory_format=torch.channels_last)
+
+        loss = _train_step(images, teacher, student, args, device)
+        scaler.scale(loss).backward()
+        
+        if step % args.grad_accum == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += loss.item() * args.grad_accum
+        global_step += 1
+        
+        if step % args.log_interval == 0:
+            print(f"epoch={epoch+1} step={step} loss={total_loss / step:.4f}")
+        
+        if args.checkpoint_dir and args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:
+            _save_checkpoint(student, args.checkpoint_dir, f"student_step_{global_step}.safetensors")
+        
+        if args.max_steps and global_step >= args.max_steps:
+            break
+    
+    return global_step
+
+
+def train(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    set_seed(args.seed)
+    _configure_cuda_optimizations(args, device)
+
+    transform = build_transforms(args.image_size)
+    loader = _create_dataloader(args, transform)
+    teacher, student = _create_models(args, device)
+
+    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     global_step = 0
     for epoch in range(args.epochs):
-        student.train()
-        total_loss = 0.0
-        for step, images in enumerate(loader, start=1):
-            images = images.to(device, non_blocking=True)
-            if args.channels_last and images.dim() == 4:
-                images = images.contiguous(memory_format=torch.channels_last)
-
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
-                    teacher_out = teacher(images)
-                    target = F.normalize(teacher_out.last_hidden_state[:, 0], dim=1)
-
-            state = torch.zeros(images.size(0), args.state_dim, device=device)
-            with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
-                for _ in range(args.recursion_steps):
-                    state, student_hash = student(images, state)
-                loss = 1.0 - F.cosine_similarity(student_hash, target).mean()
-                loss = loss / args.grad_accum
-
-            scaler.scale(loss).backward()
-            if step % args.grad_accum == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            total_loss += loss.item() * args.grad_accum
-            global_step += 1
-            if step % args.log_interval == 0:
-                avg = total_loss / step
-                print(f"epoch={epoch+1} step={step} loss={avg:.4f}")
-            if args.checkpoint_dir and args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:
-                ckpt_path = Path(args.checkpoint_dir)
-                ckpt_path.mkdir(parents=True, exist_ok=True)
-                out = ckpt_path / f"student_step_{global_step}.safetensors"
-                safetensors.torch.save_model(student, out.as_posix())
-            if args.max_steps and global_step >= args.max_steps:
-                break
-
+        global_step = _train_epoch(epoch, loader, teacher, student, optimizer, scaler, args, device, global_step)
+        
         if args.max_steps and global_step >= args.max_steps:
             break
 
         if args.checkpoint_dir:
-            ckpt_path = Path(args.checkpoint_dir)
-            ckpt_path.mkdir(parents=True, exist_ok=True)
-            out = ckpt_path / f"student_epoch_{epoch+1}.safetensors"
-            safetensors.torch.save_model(student, out.as_posix())
+            _save_checkpoint(student, args.checkpoint_dir, f"student_epoch_{epoch+1}.safetensors")
 
 
 def main():

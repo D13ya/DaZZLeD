@@ -28,10 +28,17 @@ func main() {
 		log.Fatalf("OPRF key generation failed: %v", err)
 	}
 
+	// Generate attestation secret for device attestation verification
+	attestSecret, err := crypto.GenerateDeviceSecret()
+	if err != nil {
+		log.Fatalf("attestation secret generation failed: %v", err)
+	}
+
 	mldsaPrivPath := filepath.Join(*outDir, "mldsa_priv.bin")
 	mldsaPubPath := filepath.Join(*outDir, "mldsa_pub.bin")
 	oprfPrivPath := filepath.Join(*outDir, "oprf_priv.bin")
 	oprfPubPath := filepath.Join(*outDir, "oprf_pub.bin")
+	attestSecretPath := filepath.Join(*outDir, "attest_secret.bin")
 
 	if err := os.WriteFile(mldsaPrivPath, priv.Bytes(), 0o600); err != nil {
 		log.Fatalf("write ML-DSA private key failed: %v", err)
@@ -44,6 +51,9 @@ func main() {
 	}
 	if err := os.WriteFile(oprfPubPath, oprfPub, 0o600); err != nil {
 		log.Fatalf("write OPRF public key failed: %v", err)
+	}
+	if err := os.WriteFile(attestSecretPath, attestSecret, 0o600); err != nil {
+		log.Fatalf("write attestation secret failed: %v", err)
 	}
 
 	log.Printf("authority keys written under %s", *outDir)

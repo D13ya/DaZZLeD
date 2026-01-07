@@ -28,21 +28,23 @@ const (
 	// AttestationSignatureSize is HMAC-SHA256 output size
 	AttestationSignatureSize = 32
 
-	// MinAttestationSize is version(1) + timestamp(8) + nonce(16) + deviceID length(2) + sig(32)
-	MinAttestationSize = 1 + 8 + AttestationNonceSize + 2 + AttestationSignatureSize
+	// MinAttestationSize is version(1) + timestamp(8) + nonce(16) + epochToken(32) + sig(32)
+	MinAttestationSize = 1 + 8 + AttestationNonceSize + 32 + AttestationSignatureSize
 
 	// DefaultAttestationTTL is how long an attestation is valid
 	DefaultAttestationTTL = 5 * time.Minute
 )
 
 // DeviceAttestation represents a signed device attestation blob.
-// Format: version(1) | timestamp(8) | nonce(16) | deviceIDLen(2) | deviceID(var) | signature(32)
+// Format: version(1) | timestamp(8) | nonce(16) | epochToken(32) | signature(32)
+// Note: We use an unlinkable epoch-bound pseudonymous token instead of a stable device ID
+// to prevent cross-scan device tracking (addressing Apple-PSI style surveillance concerns).
 type DeviceAttestation struct {
-	Version   byte
-	Timestamp time.Time
-	Nonce     []byte
-	DeviceID  []byte
-	Signature []byte
+	Version    byte
+	Timestamp  time.Time
+	Nonce      []byte
+	EpochToken []byte // Unlinkable per-epoch pseudonymous token (NOT a stable device ID)
+	Signature  []byte
 }
 
 // AttestationConfig holds attestation generation/verification settings.
@@ -62,12 +64,11 @@ func NewAttestationConfig(secret []byte) AttestationConfig {
 }
 
 // GenerateAttestation creates a new device attestation blob.
-func GenerateAttestation(cfg AttestationConfig, deviceID []byte) ([]byte, error) {
-	if len(deviceID) == 0 {
+// Instead of embedding a stable device ID (which enables tracking), we generate
+// an unlinkable pseudonymous token that rotates each epoch.
+func GenerateAttestation(cfg AttestationConfig, deviceSecret []byte) ([]byte, error) {
+	if len(deviceSecret) == 0 {
 		return nil, ErrDeviceIDMissing
-	}
-	if len(deviceID) > 0xFFFF {
-		return nil, ErrAttestationMalformed
 	}
 
 	// Generate random nonce
@@ -78,8 +79,14 @@ func GenerateAttestation(cfg AttestationConfig, deviceID []byte) ([]byte, error)
 
 	timestamp := time.Now().UTC()
 
-	// Build unsigned payload
-	payloadSize := 1 + 8 + AttestationNonceSize + 2 + len(deviceID)
+	// Generate unlinkable epoch token: HMAC(deviceSecret, epoch || nonce)
+	// This token is unique per attestation but cannot be linked across scans
+	epochID := uint64(timestamp.Unix() / 86400) // Daily epoch
+	epochToken := deriveEpochToken(deviceSecret, epochID, nonce)
+
+	// Build unsigned payload (fixed size, no variable-length device ID)
+	// Format: version(1) | timestamp(8) | nonce(16) | epochToken(32)
+	const payloadSize = 1 + 8 + AttestationNonceSize + 32
 	payload := make([]byte, payloadSize)
 
 	offset := 0
@@ -92,10 +99,7 @@ func GenerateAttestation(cfg AttestationConfig, deviceID []byte) ([]byte, error)
 	copy(payload[offset:], nonce)
 	offset += AttestationNonceSize
 
-	binary.BigEndian.PutUint16(payload[offset:], uint16(len(deviceID)))
-	offset += 2
-
-	copy(payload[offset:], deviceID)
+	copy(payload[offset:], epochToken)
 
 	// Sign the payload
 	signature := signAttestation(cfg.Secret, payload)
@@ -131,17 +135,16 @@ func VerifyAttestation(cfg AttestationConfig, attestation []byte) (*DeviceAttest
 	copy(nonce, attestation[offset:])
 	offset += AttestationNonceSize
 
-	deviceIDLen := binary.BigEndian.Uint16(attestation[offset:])
-	offset += 2
-
-	expectedLen := 1 + 8 + AttestationNonceSize + 2 + int(deviceIDLen) + AttestationSignatureSize
+	// New format: fixed 32-byte epoch token (no variable-length device ID)
+	const epochTokenSize = 32
+	expectedLen := 1 + 8 + AttestationNonceSize + epochTokenSize + AttestationSignatureSize
 	if len(attestation) != expectedLen {
 		return nil, ErrAttestationMalformed
 	}
 
-	deviceID := make([]byte, deviceIDLen)
-	copy(deviceID, attestation[offset:])
-	offset += int(deviceIDLen)
+	epochToken := make([]byte, epochTokenSize)
+	copy(epochToken, attestation[offset:])
+	offset += epochTokenSize
 
 	signature := attestation[offset:]
 
@@ -163,11 +166,11 @@ func VerifyAttestation(cfg AttestationConfig, attestation []byte) (*DeviceAttest
 	}
 
 	return &DeviceAttestation{
-		Version:   version,
-		Timestamp: timestamp,
-		Nonce:     nonce,
-		DeviceID:  deviceID,
-		Signature: signature,
+		Version:    version,
+		Timestamp:  timestamp,
+		Nonce:      nonce,
+		EpochToken: epochToken,
+		Signature:  signature,
 	}, nil
 }
 
@@ -178,21 +181,31 @@ func signAttestation(secret, payload []byte) []byte {
 	return mac.Sum(nil)
 }
 
-// GenerateDeviceID creates a random device identifier.
-// In production, this should come from device secure enclave or hardware ID.
-func GenerateDeviceID() ([]byte, error) {
-	id := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, id); err != nil {
-		return nil, err
-	}
-	return id, nil
+// deriveEpochToken generates an unlinkable pseudonymous token for the current epoch.
+// This token cannot be linked across epochs or to the device identity.
+func deriveEpochToken(deviceSecret []byte, epochID uint64, nonce []byte) []byte {
+	h := hmac.New(sha256.New, deviceSecret)
+	h.Write([]byte("dazzled-epoch-token-v1"))
+	epochBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(epochBytes, epochID)
+	h.Write(epochBytes)
+	h.Write(nonce)
+	return h.Sum(nil)
 }
 
-// DeriveAttestationSecret derives an attestation secret from a master key and device ID.
-// Uses HKDF-like construction for key derivation.
-func DeriveAttestationSecret(masterKey, deviceID []byte) []byte {
-	h := hmac.New(sha256.New, masterKey)
-	h.Write([]byte("dazzled-attestation-v1"))
-	h.Write(deviceID)
-	return h.Sum(nil)
+// GenerateDeviceSecret creates a random device secret for attestation.
+// In production, this MUST come from device secure enclave or HSM.
+// This secret should be stored securely and never transmitted.
+func GenerateDeviceSecret() ([]byte, error) {
+	secret := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// GenerateDeviceID is deprecated - use GenerateDeviceSecret instead.
+// Kept for backward compatibility during migration.
+func GenerateDeviceID() ([]byte, error) {
+	return GenerateDeviceSecret()
 }

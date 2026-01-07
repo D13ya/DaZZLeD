@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	proofVersion         = 1
 	tokenCleanupInterval = 5 * time.Minute
 	maxTokens            = 100000 // Prevent unbounded growth
 )
@@ -23,14 +22,15 @@ const (
 type ServerService struct {
 	oprfServer      *crypto.OPRFServer
 	mldsaPrivateKey *mldsa65.PrivateKey
-	store           storage.ProofStore
+	store           storage.Store // Full store interface for hash lookups
 	tokenTTL        time.Duration
 	tokens          map[string]time.Time
 	tokensMu        sync.Mutex
 	stopCleanup     chan struct{}
+	attestationCfg  crypto.AttestationConfig // For verifying device attestations
 }
 
-func NewServerService(oprfServer *crypto.OPRFServer, mldsaPrivateKey *mldsa65.PrivateKey, store storage.ProofStore, tokenTTL time.Duration) *ServerService {
+func NewServerService(oprfServer *crypto.OPRFServer, mldsaPrivateKey *mldsa65.PrivateKey, store storage.Store, tokenTTL time.Duration, attestationSecret []byte) *ServerService {
 	s := &ServerService{
 		oprfServer:      oprfServer,
 		mldsaPrivateKey: mldsaPrivateKey,
@@ -38,6 +38,7 @@ func NewServerService(oprfServer *crypto.OPRFServer, mldsaPrivateKey *mldsa65.Pr
 		tokenTTL:        tokenTTL,
 		tokens:          make(map[string]time.Time),
 		stopCleanup:     make(chan struct{}),
+		attestationCfg:  crypto.NewAttestationConfig(attestationSecret),
 	}
 	go s.tokenCleanupLoop()
 	return s
@@ -81,15 +82,26 @@ func (s *ServerService) HandleCheckImage(ctx context.Context, req *pb.BlindCheck
 	}
 
 	epoch := crypto.CurrentEpochID(time.Now())
-	proofInstance, _, err := s.store.GetProofBundle(epoch)
+
+	// Get the V2 signed proof bundle which contains:
+	// - The Bloom filter set digest
+	// - ML-DSA signature over the commitment (addressing "opaque list" criticism)
+	// This proves the authority approved this specific set
+	proofInstance, err := s.store.GetSignedProofBundle(epoch, s.mldsaPrivateKey)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "proof generation failed")
 	}
 
+	// Evaluate the OPRF (returns evaluation with DLEQ proof for verifiability)
+	// Note: The server CANNOT know if this is a match - that's the "oblivious" property
+	// The client will unblind and check against the set digest themselves
 	eval, err := s.oprfServer.Evaluate(req.BlindedElement)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid oprf request")
 	}
+
+	// Sign the standard payload (proofInstance || eval)
+	// This proves the server used the correct OPRF key and provides integrity
 	sigPayload := crypto.ProofSignaturePayload(proofInstance, eval)
 	proofSig, err := crypto.SignMLDSA(s.mldsaPrivateKey, sigPayload)
 	if err != nil {
@@ -98,6 +110,12 @@ func (s *ServerService) HandleCheckImage(ctx context.Context, req *pb.BlindCheck
 	token, err := s.issueToken()
 	if err != nil {
 		return nil, status.Error(codes.Internal, "token generation failed")
+	}
+
+	// Extract version from proof instance (V2 for signed bundles)
+	proofVersion := uint32(crypto.ProofVersionV1)
+	if len(proofInstance) > 0 {
+		proofVersion = uint32(proofInstance[0])
 	}
 
 	return &pb.BlindCheckResponse{
@@ -114,9 +132,29 @@ func (s *ServerService) HandleUploadShare(ctx context.Context, req *pb.VoucherSh
 	if len(req.GetUploadToken()) == 0 || len(req.GetDeviceAttestation()) == 0 {
 		return &pb.ShareResponse{Status: pb.ShareResponse_REJECTED}, nil
 	}
+
+	// Verify upload token first
 	if !s.consumeToken(req.GetUploadToken()) {
 		return &pb.ShareResponse{Status: pb.ShareResponse_REJECTED}, nil
 	}
+
+	// Cryptographically verify the device attestation
+	// In dev mode, use the well-known shared secret for testing
+	attestCfg := s.attestationCfg
+	if IsDevMode() && len(DevAttestationSecret) > 0 {
+		attestCfg = crypto.NewAttestationConfig(DevAttestationSecret)
+	}
+
+	attestation, err := crypto.VerifyAttestation(attestCfg, req.GetDeviceAttestation())
+	if err != nil {
+		// Attestation verification failed - reject the share
+		return &pb.ShareResponse{Status: pb.ShareResponse_REJECTED}, nil
+	}
+
+	// Attestation is valid - the epoch token proves device authenticity
+	// Note: We don't track epoch tokens across requests (unlinkable by design)
+	_ = attestation // Used for verification, epoch token is intentionally not logged
+
 	return &pb.ShareResponse{Status: pb.ShareResponse_ACCEPTED}, nil
 }
 
