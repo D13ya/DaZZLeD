@@ -1,7 +1,3 @@
-Here is the comprehensive README.md for the **Recursive Safety** project. It consolidates the machine learning architecture, post-quantum cryptographic protocols, and system design we discussed into a single, production-ready document.
-
----
-
 # **Recursive Safety: Post-Quantum Content Detection Protocol**
 
 A Zero-Knowledge, Adversarially Robust Surveillance Architecture
