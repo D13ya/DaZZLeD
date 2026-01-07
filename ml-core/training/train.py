@@ -21,7 +21,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
 class FlatImageDataset(Dataset):
-    def __init__(self, root, transform, list_file=None, max_images=None, seed=0):
+    def __init__(self, root, transform, list_file=None, max_images=None, seed=0, cache_ram=False):
         if list_file:
             base = Path(list_file).resolve().parent
             raw_paths = [p.strip() for p in Path(list_file).read_text().splitlines() if p.strip()]
@@ -43,13 +43,33 @@ class FlatImageDataset(Dataset):
             rng = random.Random(seed)
             rng.shuffle(self.paths)
             self.paths = self.paths[:max_images]
+        
         self.transform = transform
+        self.cache_ram = cache_ram
+        self.images = [None] * len(self.paths)
+        
+        if self.cache_ram:
+            print(f"Loading {len(self.paths)} images into RAM...")
+            # Detect excessive memory usage risk
+            is_windows = sys.platform.startswith('win')
+            if is_windows:
+                print("⚠️ Warning: --cache-ram on Windows duplicates memory per worker. Consider --workers 0 if OOM occurs.")
+            
+            from tqdm import tqdm
+            for i, p in enumerate(tqdm(self.paths, desc="Caching")):
+                # Store as decoded RGB to save decoding time during training
+                with Image.open(p) as img:
+                    self.images[i] = img.convert("RGB")
+            print("Finished caching.")
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        img = Image.open(self.paths[idx]).convert("RGB")
+        if self.cache_ram:
+            img = self.images[idx]
+        else:
+            img = Image.open(self.paths[idx]).convert("RGB")
         return self.transform(img)
 
 
@@ -91,6 +111,7 @@ def train(args):
         list_file=args.data_list,
         max_images=args.max_images,
         seed=args.seed,
+        cache_ram=args.cache_ram,
     )
     loader = DataLoader(
         dataset,
@@ -178,6 +199,7 @@ def main():
     parser.add_argument("--recursion-steps", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--cache-ram", action="store_true", help="Cache all images in RAM (decodes to RGB). Use with caution on Windows (high memory usage per worker).")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--checkpoint-dir", default="")
     parser.add_argument("--checkpoint-every", type=int, default=0, help="Save every N steps (0 disables).")
