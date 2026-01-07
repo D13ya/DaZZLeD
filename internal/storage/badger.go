@@ -160,43 +160,80 @@ func (s *BadgerStore) runGC(interval time.Duration) {
 
 // GetProofBundle retrieves or generates the proof bundle for an epoch.
 func (s *BadgerStore) GetProofBundle(epoch uint64) ([]byte, []byte, error) {
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return nil, nil, ErrStoreClosed
+	if err := s.ensureOpen(); err != nil {
+		return nil, nil, err
 	}
-	s.mu.RUnlock()
 
-	// Check cache first
-	s.cache.RLock()
-	if epoch == s.cache.epochID && len(s.cache.proofInstance) > 0 {
-		pi, mp := s.cache.proofInstance, s.cache.membershipProof
-		s.cache.RUnlock()
+	if pi, mp, ok := s.getFromCache(epoch); ok {
 		return pi, mp, nil
 	}
-	s.cache.RUnlock()
 
-	// Try to load from database
+	proofInstance, membershipProof, err := s.loadOrGenerateBundle(epoch)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.updateCache(epoch, proofInstance, membershipProof)
+	return proofInstance, membershipProof, nil
+}
+
+func (s *BadgerStore) ensureOpen() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+	return nil
+}
+
+func (s *BadgerStore) getFromCache(epoch uint64) ([]byte, []byte, bool) {
+	s.cache.RLock()
+	defer s.cache.RUnlock()
+	if epoch == s.cache.epochID && len(s.cache.proofInstance) > 0 {
+		return s.cache.proofInstance, s.cache.membershipProof, true
+	}
+	return nil, nil, false
+}
+
+func (s *BadgerStore) updateCache(epoch uint64, proofInstance, membershipProof []byte) {
+	s.cache.Lock()
+	s.cache.epochID = epoch
+	s.cache.proofInstance = proofInstance
+	s.cache.membershipProof = membershipProof
+	s.cache.Unlock()
+}
+
+func (s *BadgerStore) loadOrGenerateBundle(epoch uint64) ([]byte, []byte, error) {
+	proofInstance, membershipProof, err := s.loadBundleFromDB(epoch)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(proofInstance) == 0 {
+		return s.generateAndStoreProofBundle(epoch)
+	}
+	return proofInstance, membershipProof, nil
+}
+
+func (s *BadgerStore) loadBundleFromDB(epoch uint64) ([]byte, []byte, error) {
 	piKey := makeEpochKey(prefixProofInstance, epoch)
 	mpKey := makeEpochKey(prefixMembershipProof, epoch)
 
 	var proofInstance, membershipProof []byte
 
 	err := s.db.View(func(txn *badger.Txn) error {
-		// Load proof instance
-		item, err := txn.Get(piKey)
-		if err == nil {
-			proofInstance, err = item.ValueCopy(nil)
-			if err != nil {
+		if item, err := txn.Get(piKey); err == nil {
+			if val, err := item.ValueCopy(nil); err == nil {
+				proofInstance = val
+			} else {
 				return err
 			}
 		}
 
-		// Load membership proof
-		item, err = txn.Get(mpKey)
-		if err == nil {
-			membershipProof, err = item.ValueCopy(nil)
-			if err != nil {
+		if item, err := txn.Get(mpKey); err == nil {
+			if val, err := item.ValueCopy(nil); err == nil {
+				membershipProof = val
+			} else {
 				return err
 			}
 		}
@@ -207,21 +244,6 @@ func (s *BadgerStore) GetProofBundle(epoch uint64) ([]byte, []byte, error) {
 	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 		return nil, nil, fmt.Errorf("load proof bundle: %w", err)
 	}
-
-	// Generate new if not found
-	if len(proofInstance) == 0 {
-		proofInstance, membershipProof, err = s.generateAndStoreProofBundle(epoch)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// Update cache
-	s.cache.Lock()
-	s.cache.epochID = epoch
-	s.cache.proofInstance = proofInstance
-	s.cache.membershipProof = membershipProof
-	s.cache.Unlock()
 
 	return proofInstance, membershipProof, nil
 }
