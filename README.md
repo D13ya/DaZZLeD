@@ -69,7 +69,7 @@ To solve the "Auditability" problem without massive bandwidth, we implement **Sp
 
 * **Training:** PyTorch \+ Transformers (HuggingFace)  
 * **Inference:** ONNX Runtime  
-* **Teacher Model:** Meta DINOv3 (ViT-Large)
+* **Teacher Model:** Meta DINOv3 (ViT-L/16, `facebook/dinov3-vitl16-pretrain-lvd1689m`)
 
 ---
 
@@ -390,11 +390,12 @@ This project implements concepts from the following papers:
 2. **"Proof-Carrying Data without Succinct Arguments"** (Bünz et al., Crypto 2020\)  
    * *Source of the "Split Accumulation" logic, allowing us to verify the database without heavy SNARKs.*  
    * [Read Paper](https://eprint.iacr.org/2020/1618.pdf)  
-3. **"Less is More: Recursive Reasoning with Tiny Networks"** (Samsung SAIL, 2024\)  
-   * *The architectural basis for our "Thinking" hash function.*  
-   * [arXiv:2410.04871](https://arxiv.org/abs/2410.04871)  
-4. **"DINOv3: Learning State-of-the-art Dense Visual Features"** (Meta AI, 2025\)  
+3. **"Less is More: Recursive Reasoning with Tiny Networks"** (Jolicoeur-Martineau, 2025)
+   * *The architectural basis for our "Thinking" hash function (TRM architecture).*
+   * [arXiv:2510.04871](https://arxiv.org/abs/2510.04871)
+4. **"DINOv3: Self-Supervised Vision Foundation Model"** (Siméoni et al., Meta AI, 2025)
    * *Used as the frozen teacher model for semantic robustness.*
+   * [arXiv:2508.10104](https://arxiv.org/abs/2508.10104)
 
 ---
 

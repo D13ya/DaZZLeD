@@ -169,7 +169,7 @@ def main():
     parser.add_argument("--data", default="", help="Root folder containing images.")
     parser.add_argument("--data-list", default="", help="Optional text file with one image path per line.")
     parser.add_argument("--max-images", type=int, default=0, help="Optional cap on number of images.")
-    parser.add_argument("--teacher", default="facebook/dinov3-vit-large-14")
+    parser.add_argument("--teacher", default="facebook/dinov3-vitl16-pretrain-lvd1689m")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--image-size", type=int, default=224)
