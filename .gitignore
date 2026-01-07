@@ -15,6 +15,17 @@ go.work.sum
 # Protobuf generated files
 api/proto/v1/*.pb.go
 
+# Docs (ignore all Markdown except the root README)
+*.md
+!README.md
+
+# SonarQube / scanner outputs
+.scannerwork/
+scannerwork/
+
+# Git ignore file (note: if already tracked, you'll need to untrack it once)
+.gitignore
+
 # Python caches and virtualenvs
 __pycache__/
 *.pyc
@@ -36,9 +47,14 @@ ml-core/data/
 
 # Certificates and secrets
 certs/
+keys/
 *.key
 *.pem
 *.crt
 
 # Logs
 *.log
+
+# Local PDFs (research papers)
+2024-1869.pdf
+Proof-Carrying Data without Succinct Arguments.pdf

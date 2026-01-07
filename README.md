@@ -111,7 +111,7 @@ internal/
     params.go                  - Crypto constants shared by modules
     verify.go                  - Signature verification stub
     dilithium/
-      keys.go                  - ML-DSA key generation stub
+      keys.go                  - ML-DSA key generation + parsing helpers
     lattice/
       params.go                - Ring parameters (n, q, k)
       vector.go                - Lattice vector serialization + math
@@ -254,7 +254,7 @@ python training\export_onnx.py --checkpoint .\checkpoints\student_epoch_5.safete
 
 ### **1\.1 Train in Google Colab (Recommended for GPU)**
 
-If your local machine has no GPU, use Colab. A full walk‑through is in `ml-core/COLAB.md`. Example Colab command:
+If your local machine has no GPU, use Colab. A full walk‑through (including A100 profile settings) is in `ml-core/COLAB.md`. Example Colab command:
 
 ```python
 !python training/train.py \
@@ -309,17 +309,19 @@ $env:PROTOC_INCLUDE = "C:/Program Files/protoc-win64/include"
 
 ### **2\. Initialize the Trusted Authority**
 
-Simulate the NCMEC root key generation (Lattice-based).
+Generate the ML-DSA (signing) and OPRF keys for the authority.
 
 Bash
 
-go run cmd/setup/main.go \--out ./certs/authority.key
+go run cmd/setup/main.go \--out-dir ./keys
 
 PowerShell (Windows)
 
 ```powershell
-go run .\cmd\setup\main.go --out .\certs\authority.key
+go run .\cmd\setup\main.go --out-dir .\keys
 ```
+
+Outputs: `keys/mldsa_priv.bin`, `keys/mldsa_pub.bin`, `keys/oprf_priv.bin`, `keys/oprf_pub.bin`.
 
 ### **3\. Run the Server**
 
@@ -327,12 +329,12 @@ Start the authority node that listens for blinded queries.
 
 Bash
 
-go run cmd/server/main.go \--port 50051
+go run cmd/server/main.go \--port 50051 \--mldsa-priv ./keys/mldsa_priv.bin \--oprf-priv ./keys/oprf_priv.bin
 
 PowerShell (Windows)
 
 ```powershell
-go run .\cmd\server\main.go --port 50051
+go run .\cmd\server\main.go --port 50051 --mldsa-priv .\keys\mldsa_priv.bin --oprf-priv .\keys\oprf_priv.bin
 ```
 
 ### **4\. Run the Client Scan**
@@ -341,12 +343,12 @@ Scan a local image. This runs the ONNX model, blinds the hash, and queries the s
 
 Bash
 
-go run cmd/client/main.go \--image ./samples/test\_image.jpg \--server localhost:50051
+go run cmd/client/main.go \--image ./samples/test\_image.jpg \--server localhost:50051 \--mldsa-pub ./keys/mldsa_pub.bin
 
 PowerShell (Windows)
 
 ```powershell
-go run .\cmd\client\main.go --image .\samples\test_image.jpg --server localhost:50051
+go run .\cmd\client\main.go --image .\samples\test_image.jpg --server localhost:50051 --mldsa-pub .\keys\mldsa_pub.bin
 ```
 
 ---
@@ -371,9 +373,9 @@ go build -o bin\server.exe .\cmd\server
 go build -o bin\setup.exe .\cmd\setup
 
 # 4) Run
-.\bin\setup.exe --out .\certs\authority.key
-.\bin\server.exe --port 50051 --insecure
-.\bin\client.exe --image .\samples\test_image.jpg --server localhost:50051 --insecure
+.\bin\setup.exe --out-dir .\keys
+.\bin\server.exe --port 50051 --mldsa-priv .\keys\mldsa_priv.bin --oprf-priv .\keys\oprf_priv.bin --insecure
+.\bin\client.exe --image .\samples\test_image.jpg --server localhost:50051 --mldsa-pub .\keys\mldsa_pub.bin --insecure
 ```
 
 ---

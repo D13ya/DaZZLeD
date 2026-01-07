@@ -8,18 +8,23 @@ import (
 	pb "github.com/D13ya/DaZZLeD/api/proto/v1"
 	"github.com/D13ya/DaZZLeD/internal/bridge"
 	"github.com/D13ya/DaZZLeD/internal/crypto"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
 
 type ClientService struct {
-	client          pb.AuthorityServiceClient
-	recursionSteps  int
-	epochMaxSkew    uint64
-	requestTimeout  time.Duration
+	client         pb.AuthorityServiceClient
+	oprfClient     *crypto.OPRFClient
+	mldsaPublicKey *mldsa65.PublicKey
+	recursionSteps int
+	epochMaxSkew   uint64
+	requestTimeout time.Duration
 }
 
-func NewClientService(client pb.AuthorityServiceClient, recursionSteps int) *ClientService {
+func NewClientService(client pb.AuthorityServiceClient, recursionSteps int, mldsaPublicKey *mldsa65.PublicKey) *ClientService {
 	return &ClientService{
 		client:         client,
+		oprfClient:     crypto.NewOPRFClient(),
+		mldsaPublicKey: mldsaPublicKey,
 		recursionSteps: recursionSteps,
 		epochMaxSkew:   1,
 		requestTimeout: 3 * time.Second,
@@ -35,17 +40,16 @@ func (s *ClientService) ScanImage(ctx context.Context, imagePath, modelVersion s
 	hashVec := bridge.RecursiveInference(imgBytes, s.recursionSteps)
 	latticePoint := bridge.MapToLattice(hashVec)
 
-	blindingFactor, err := crypto.NewRandomScalar()
+	state, blindedRequest, err := s.oprfClient.Blind(latticePoint.Marshal())
 	if err != nil {
 		return err
 	}
-	blindedPoint := crypto.Blind(latticePoint, blindingFactor)
 
 	ctx, cancel := context.WithTimeout(ctx, s.requestTimeout)
 	defer cancel()
 
 	resp, err := s.client.CheckImage(ctx, &pb.BlindCheckRequest{
-		BlindedElement: blindedPoint.Marshal(),
+		BlindedElement: blindedRequest,
 		ModelVersion:   modelVersion,
 	})
 	if err != nil {
@@ -59,12 +63,16 @@ func (s *ClientService) ScanImage(ctx context.Context, imagePath, modelVersion s
 		return errors.New("split accumulator verification failed")
 	}
 
-	unblindedSig, err := crypto.Unblind(resp.BlindedSignature, blindingFactor)
+	sigPayload := crypto.ProofSignaturePayload(resp.ProofInstance, resp.BlindedSignature)
+	if !crypto.VerifyMLDSA(s.mldsaPublicKey, sigPayload, resp.MembershipProof) {
+		return errors.New("invalid proof signature")
+	}
+
+	oprfOutput, err := s.oprfClient.Finalize(state, resp.BlindedSignature)
 	if err != nil {
 		return err
 	}
-	isMatch := crypto.VerifyMLDSA(latticePoint, unblindedSig)
-	if !isMatch {
+	if len(oprfOutput) == 0 {
 		return nil
 	}
 

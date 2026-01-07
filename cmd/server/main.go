@@ -16,28 +16,29 @@ import (
 	"github.com/D13ya/DaZZLeD/internal/crypto"
 	"github.com/D13ya/DaZZLeD/internal/crypto/dilithium"
 	"github.com/D13ya/DaZZLeD/internal/storage"
+	"github.com/cloudflare/circl/oprf"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
 func main() {
 	port := flag.String("port", "50051", "listen port")
-	privKey := flag.Uint("privkey", 0, "server private scalar (optional)")
+	mldsaPrivPath := flag.String("mldsa-priv", "keys/mldsa_priv.bin", "path to ML-DSA private key")
+	oprfPrivPath := flag.String("oprf-priv", "keys/oprf_priv.bin", "path to OPRF private key")
 	tlsCert := flag.String("tls-cert", "", "path to server certificate (PEM)")
 	tlsKey := flag.String("tls-key", "", "path to server private key (PEM)")
 	tlsCA := flag.String("tls-ca", "", "path to CA bundle for client auth (PEM)")
 	insecureMode := flag.Bool("insecure", false, "disable TLS (development only)")
 	flag.Parse()
 
-	var sk uint32
-	if *privKey == 0 {
-		val, err := dilithium.GeneratePrivateScalar()
-		if err != nil {
-			log.Fatalf("key generation failed: %v", err)
-		}
-		sk = val
-	} else {
-		sk = uint32(*privKey)
+	mldsaKey, err := loadMLDSAPrivateKey(*mldsaPrivPath)
+	if err != nil {
+		log.Fatalf("ML-DSA key load failed: %v", err)
+	}
+	oprfKey, err := loadOPRFPrivateKey(*oprfPrivPath)
+	if err != nil {
+		log.Fatalf("OPRF key load failed: %v", err)
 	}
 
 	lis, err := net.Listen("tcp", ":"+*port)
@@ -53,7 +54,7 @@ func main() {
 	}
 
 	store := storage.NewBadgerStore()
-	service := app.NewServerService(crypto.Signer{PrivateKey: sk}, store, 10*time.Minute)
+	service := app.NewServerService(crypto.NewOPRFServer(oprfKey), mldsaKey, store, 10*time.Minute)
 	handler := api.NewGRPCHandler(service)
 
 	grpcServer := grpc.NewServer(opts...)
@@ -63,6 +64,22 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve failed: %v", err)
 	}
+}
+
+func loadMLDSAPrivateKey(path string) (*mldsa65.PrivateKey, error) {
+	keyBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return dilithium.ParsePrivateKey(keyBytes)
+}
+
+func loadOPRFPrivateKey(path string) (*oprf.PrivateKey, error) {
+	keyBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return crypto.ParseOPRFPrivateKey(keyBytes)
 }
 
 func buildServerCreds(certPath, keyPath, caPath string, insecureMode bool) (credentials.TransportCredentials, error) {

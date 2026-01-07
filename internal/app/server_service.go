@@ -8,8 +8,8 @@ import (
 
 	pb "github.com/D13ya/DaZZLeD/api/proto/v1"
 	"github.com/D13ya/DaZZLeD/internal/crypto"
-	"github.com/D13ya/DaZZLeD/internal/crypto/lattice"
 	"github.com/D13ya/DaZZLeD/internal/storage"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -17,19 +17,21 @@ import (
 const proofVersion = 1
 
 type ServerService struct {
-	signer     crypto.Signer
-	store      storage.ProofStore
-	tokenTTL   time.Duration
-	tokens     map[string]time.Time
-	tokensMu   sync.Mutex
+	oprfServer     *crypto.OPRFServer
+	mldsaPrivateKey *mldsa65.PrivateKey
+	store          storage.ProofStore
+	tokenTTL       time.Duration
+	tokens         map[string]time.Time
+	tokensMu       sync.Mutex
 }
 
-func NewServerService(signer crypto.Signer, store storage.ProofStore, tokenTTL time.Duration) *ServerService {
+func NewServerService(oprfServer *crypto.OPRFServer, mldsaPrivateKey *mldsa65.PrivateKey, store storage.ProofStore, tokenTTL time.Duration) *ServerService {
 	return &ServerService{
-		signer:   signer,
-		store:    store,
-		tokenTTL: tokenTTL,
-		tokens:   make(map[string]time.Time),
+		oprfServer:     oprfServer,
+		mldsaPrivateKey: mldsaPrivateKey,
+		store:          store,
+		tokenTTL:       tokenTTL,
+		tokens:         make(map[string]time.Time),
 	}
 }
 
@@ -41,27 +43,30 @@ func (s *ServerService) HandleCheckImage(ctx context.Context, req *pb.BlindCheck
 		return nil, status.Error(codes.InvalidArgument, "empty blinded_element")
 	}
 
-	point, err := lattice.Deserialize(req.BlindedElement)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid lattice encoding")
-	}
-
 	epoch := crypto.CurrentEpochID(time.Now())
-	proofInstance, membershipProof, err := s.store.GetProofBundle(epoch)
+	proofInstance, _, err := s.store.GetProofBundle(epoch)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "proof generation failed")
 	}
 
-	sig := s.signer.SignBlinded(point)
+	eval, err := s.oprfServer.Evaluate(req.BlindedElement)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid oprf request")
+	}
+	sigPayload := crypto.ProofSignaturePayload(proofInstance, eval)
+	proofSig, err := crypto.SignMLDSA(s.mldsaPrivateKey, sigPayload)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "proof signing failed")
+	}
 	token, err := s.issueToken()
 	if err != nil {
 		return nil, status.Error(codes.Internal, "token generation failed")
 	}
 
 	return &pb.BlindCheckResponse{
-		BlindedSignature: sig,
+		BlindedSignature: eval,
 		ProofInstance:    proofInstance,
-		MembershipProof:  membershipProof,
+		MembershipProof:  proofSig,
 		EpochId:          epoch,
 		ProofVersion:     proofVersion,
 		UploadToken:      token,

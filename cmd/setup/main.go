@@ -1,36 +1,50 @@
 package main
 
 import (
-	"encoding/hex"
 	"flag"
 	"log"
 	"os"
 	"path/filepath"
 
+	"github.com/D13ya/DaZZLeD/internal/crypto"
 	"github.com/D13ya/DaZZLeD/internal/crypto/dilithium"
 )
 
 func main() {
-	outPath := flag.String("out", "authority.key", "output key path")
+	outDir := flag.String("out-dir", "keys", "output directory for authority keys")
 	flag.Parse()
 
-	key, err := dilithium.GeneratePrivateScalar()
-	if err != nil {
-		log.Fatalf("key generation failed: %v", err)
-	}
-
-	encoded := []byte(hex.EncodeToString([]byte{
-		byte(key >> 24),
-		byte(key >> 16),
-		byte(key >> 8),
-		byte(key),
-	}))
-
-	if err := os.MkdirAll(filepath.Dir(*outPath), 0o700); err != nil && filepath.Dir(*outPath) != "." {
+	if err := os.MkdirAll(*outDir, 0o700); err != nil && *outDir != "." {
 		log.Fatalf("mkdir failed: %v", err)
 	}
-	if err := os.WriteFile(*outPath, encoded, 0o600); err != nil {
-		log.Fatalf("write failed: %v", err)
+
+	pub, priv, err := dilithium.GenerateKeyPair()
+	if err != nil {
+		log.Fatalf("ML-DSA key generation failed: %v", err)
 	}
-	log.Printf("authority key written to %s", *outPath)
+
+	oprfPriv, oprfPub, err := crypto.GenerateOPRFKeyPair()
+	if err != nil {
+		log.Fatalf("OPRF key generation failed: %v", err)
+	}
+
+	mldsaPrivPath := filepath.Join(*outDir, "mldsa_priv.bin")
+	mldsaPubPath := filepath.Join(*outDir, "mldsa_pub.bin")
+	oprfPrivPath := filepath.Join(*outDir, "oprf_priv.bin")
+	oprfPubPath := filepath.Join(*outDir, "oprf_pub.bin")
+
+	if err := os.WriteFile(mldsaPrivPath, priv.Bytes(), 0o600); err != nil {
+		log.Fatalf("write ML-DSA private key failed: %v", err)
+	}
+	if err := os.WriteFile(mldsaPubPath, pub.Bytes(), 0o600); err != nil {
+		log.Fatalf("write ML-DSA public key failed: %v", err)
+	}
+	if err := os.WriteFile(oprfPrivPath, oprfPriv, 0o600); err != nil {
+		log.Fatalf("write OPRF private key failed: %v", err)
+	}
+	if err := os.WriteFile(oprfPubPath, oprfPub, 0o600); err != nil {
+		log.Fatalf("write OPRF public key failed: %v", err)
+	}
+
+	log.Printf("authority keys written under %s", *outDir)
 }

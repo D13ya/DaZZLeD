@@ -81,6 +81,8 @@ def train(args):
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    if args.cudnn_benchmark and device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     transform = build_transforms(args.image_size)
     dataset = FlatImageDataset(
@@ -104,6 +106,8 @@ def train(args):
     teacher.eval()
 
     student = RecursiveHasher(state_dim=args.state_dim, hash_dim=args.hash_dim).to(device)
+    if args.channels_last and device.type == "cuda":
+        student = student.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
@@ -116,6 +120,8 @@ def train(args):
         total_loss = 0.0
         for step, images in enumerate(loader, start=1):
             images = images.to(device, non_blocking=True)
+            if args.channels_last and images.dim() == 4:
+                images = images.contiguous(memory_format=torch.channels_last)
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
@@ -180,6 +186,8 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA.")
     parser.add_argument("--allow-tf32", action="store_true", help="Enable TF32 on CUDA.")
+    parser.add_argument("--channels-last", action="store_true", help="Use channels_last memory format for images.")
+    parser.add_argument("--cudnn-benchmark", action="store_true", help="Enable cudnn benchmark for conv layers.")
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)

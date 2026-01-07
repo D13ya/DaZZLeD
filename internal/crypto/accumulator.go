@@ -28,6 +28,13 @@ func BuildProofInstance(version byte, epochID uint64, commitment []byte) []byte 
 	return out
 }
 
+func ProofSignaturePayload(proofInstance, blindedSignature []byte) []byte {
+	payload := make([]byte, 0, len(proofInstance)+len(blindedSignature))
+	payload = append(payload, proofInstance...)
+	payload = append(payload, blindedSignature...)
+	return payload
+}
+
 func CurrentEpochID(now time.Time) uint64 {
 	return uint64(now.Unix() / 86400)
 }

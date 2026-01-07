@@ -1,8 +1,11 @@
 package crypto
 
-import "github.com/D13ya/DaZZLeD/internal/crypto/lattice"
+import "github.com/cloudflare/circl/sign/mldsa/mldsa65"
 
-// VerifyMLDSA is a placeholder verifier; replace with ML-DSA verification.
-func VerifyMLDSA(_ lattice.Vector, signature []byte) bool {
-	return len(signature) > 0
+// VerifyMLDSA checks an ML-DSA-65 signature over the provided message.
+func VerifyMLDSA(publicKey *mldsa65.PublicKey, message, signature []byte) bool {
+	if publicKey == nil {
+		return false
+	}
+	return mldsa65.Verify(publicKey, message, nil, signature)
 }

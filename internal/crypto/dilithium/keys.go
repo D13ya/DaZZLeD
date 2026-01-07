@@ -2,22 +2,29 @@ package dilithium
 
 import (
 	"crypto/rand"
-	"encoding/binary"
-	"io"
 
-	"github.com/D13ya/DaZZLeD/internal/crypto/lattice"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
 
-// GeneratePrivateScalar produces a placeholder private scalar in R_q.
-func GeneratePrivateScalar() (uint32, error) {
-	for {
-		var buf [4]byte
-		if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
-			return 0, err
-		}
-		val := binary.BigEndian.Uint32(buf[:]) % lattice.ModulusQ
-		if val != 0 {
-			return val, nil
-		}
+// GenerateKeyPair creates an ML-DSA-65 keypair.
+func GenerateKeyPair() (*mldsa65.PublicKey, *mldsa65.PrivateKey, error) {
+	return mldsa65.GenerateKey(rand.Reader)
+}
+
+// ParsePublicKey decodes a packed ML-DSA-65 public key.
+func ParsePublicKey(data []byte) (*mldsa65.PublicKey, error) {
+	pk := &mldsa65.PublicKey{}
+	if err := pk.UnmarshalBinary(data); err != nil {
+		return nil, err
 	}
+	return pk, nil
+}
+
+// ParsePrivateKey decodes a packed ML-DSA-65 private key.
+func ParsePrivateKey(data []byte) (*mldsa65.PrivateKey, error) {
+	sk := &mldsa65.PrivateKey{}
+	if err := sk.UnmarshalBinary(data); err != nil {
+		return nil, err
+	}
+	return sk, nil
 }

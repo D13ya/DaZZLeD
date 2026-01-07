@@ -11,6 +11,8 @@ import (
 
 	pb "github.com/D13ya/DaZZLeD/api/proto/v1"
 	"github.com/D13ya/DaZZLeD/internal/app"
+	"github.com/D13ya/DaZZLeD/internal/crypto/dilithium"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,6 +23,7 @@ func main() {
 	serverAddr := flag.String("server", "localhost:50051", "authority server address")
 	modelVersion := flag.String("model-version", "TRM-v2-DINO", "model version identifier")
 	recursionSteps := flag.Int("recursion-steps", 16, "number of recursive hashing steps")
+	mldsaPubPath := flag.String("mldsa-pub", "keys/mldsa_pub.bin", "path to ML-DSA public key")
 	tlsCA := flag.String("tls-ca", "", "path to server CA certificate (PEM)")
 	tlsCert := flag.String("tls-cert", "", "path to client certificate (PEM)")
 	tlsKey := flag.String("tls-key", "", "path to client private key (PEM)")
@@ -42,7 +45,11 @@ func main() {
 	defer conn.Close()
 
 	client := pb.NewAuthorityServiceClient(conn)
-	service := app.NewClientService(client, *recursionSteps)
+	mldsaKey, err := loadMLDSAPublicKey(*mldsaPubPath)
+	if err != nil {
+		log.Fatalf("ML-DSA public key load failed: %v", err)
+	}
+	service := app.NewClientService(client, *recursionSteps, mldsaKey)
 	if err := service.ScanImage(context.Background(), *imagePath, *modelVersion); err != nil {
 		log.Fatalf("scan failed: %v", err)
 	}
@@ -81,3 +88,11 @@ func buildCreds(caPath, certPath, keyPath string, insecureMode bool) (credential
 }
 
 var errMissingClientCreds = errors.New("both --tls-cert and --tls-key are required when one is set")
+
+func loadMLDSAPublicKey(path string) (*mldsa65.PublicKey, error) {
+	keyBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return dilithium.ParsePublicKey(keyBytes)
+}
