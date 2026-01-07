@@ -14,24 +14,61 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const proofVersion = 1
+const (
+	proofVersion         = 1
+	tokenCleanupInterval = 5 * time.Minute
+	maxTokens            = 100000 // Prevent unbounded growth
+)
 
 type ServerService struct {
-	oprfServer     *crypto.OPRFServer
+	oprfServer      *crypto.OPRFServer
 	mldsaPrivateKey *mldsa65.PrivateKey
-	store          storage.ProofStore
-	tokenTTL       time.Duration
-	tokens         map[string]time.Time
-	tokensMu       sync.Mutex
+	store           storage.ProofStore
+	tokenTTL        time.Duration
+	tokens          map[string]time.Time
+	tokensMu        sync.Mutex
+	stopCleanup     chan struct{}
 }
 
 func NewServerService(oprfServer *crypto.OPRFServer, mldsaPrivateKey *mldsa65.PrivateKey, store storage.ProofStore, tokenTTL time.Duration) *ServerService {
-	return &ServerService{
-		oprfServer:     oprfServer,
+	s := &ServerService{
+		oprfServer:      oprfServer,
 		mldsaPrivateKey: mldsaPrivateKey,
-		store:          store,
-		tokenTTL:       tokenTTL,
-		tokens:         make(map[string]time.Time),
+		store:           store,
+		tokenTTL:        tokenTTL,
+		tokens:          make(map[string]time.Time),
+		stopCleanup:     make(chan struct{}),
+	}
+	go s.tokenCleanupLoop()
+	return s
+}
+
+// Stop gracefully shuts down the service.
+func (s *ServerService) Stop() {
+	close(s.stopCleanup)
+}
+
+func (s *ServerService) tokenCleanupLoop() {
+	ticker := time.NewTicker(tokenCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupExpiredTokens()
+		case <-s.stopCleanup:
+			return
+		}
+	}
+}
+
+func (s *ServerService) cleanupExpiredTokens() {
+	s.tokensMu.Lock()
+	defer s.tokensMu.Unlock()
+	now := time.Now()
+	for k, exp := range s.tokens {
+		if now.After(exp) {
+			delete(s.tokens, k)
+		}
 	}
 }
 
@@ -90,8 +127,41 @@ func (s *ServerService) issueToken() ([]byte, error) {
 	}
 	s.tokensMu.Lock()
 	defer s.tokensMu.Unlock()
+	// Prevent unbounded token growth
+	if len(s.tokens) >= maxTokens {
+		// Evict oldest tokens if at capacity
+		s.evictOldestTokensLocked(maxTokens / 10)
+	}
 	s.tokens[base64.StdEncoding.EncodeToString(token)] = time.Now().Add(s.tokenTTL)
 	return token, nil
+}
+
+// evictOldestTokensLocked removes the n oldest tokens. Caller must hold tokensMu.
+func (s *ServerService) evictOldestTokensLocked(n int) {
+	if n <= 0 || len(s.tokens) == 0 {
+		return
+	}
+	// Find and remove oldest tokens
+	type tokenEntry struct {
+		key string
+		exp time.Time
+	}
+	entries := make([]tokenEntry, 0, len(s.tokens))
+	for k, exp := range s.tokens {
+		entries = append(entries, tokenEntry{k, exp})
+	}
+	// Sort by expiration (oldest first)
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].exp.Before(entries[i].exp) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	// Delete oldest n
+	for i := 0; i < n && i < len(entries); i++ {
+		delete(s.tokens, entries[i].key)
+	}
 }
 
 func (s *ServerService) consumeToken(token []byte) bool {
