@@ -4,8 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"sync"
 
 	"github.com/cloudflare/circl/oprf"
+	"github.com/cloudflare/circl/zk/dleq"
 )
 
 // OPRF Protocol Abstraction
@@ -68,29 +71,62 @@ type OPRFServerInterface interface {
 	Suite() OPRFSuite
 }
 
-// OPRFClient implements OPRFClientInterface using Ristretto255.
-type OPRFClient struct {
-	client oprf.Client
+// VOPRFClient implements verifiable OPRF client using Ristretto255.
+// VOPRF mode allows clients to verify that the server used the correct key,
+// addressing the "opaque list" critique where clients cannot audit server behavior.
+type VOPRFClient struct {
+	client    oprf.VerifiableClient
+	publicKey *oprf.PublicKey
 }
 
-// OPRFServer implements OPRFServerInterface using Ristretto255.
+// OPRFClient wraps VOPRFClient for backward compatibility.
+// Now uses verifiable mode by default for auditability.
+type OPRFClient struct {
+	voprf *VOPRFClient
+}
+
+// OPRFServer implements OPRFServerInterface using Ristretto255 in verifiable mode.
+// The mutex protects against a race in CIRCL's lazy public key initialization.
 type OPRFServer struct {
-	server oprf.Server
+	server oprf.VerifiableServer
+	mu     sync.Mutex // Protects concurrent Evaluate calls (CIRCL race workaround)
 }
 
 // OPRFState holds the blinding state needed for finalization.
 type OPRFState struct {
-	finalize *oprf.FinalizeData
+	finalize  *oprf.FinalizeData
+	publicKey *oprf.PublicKey // Server's public key for verification
+}
+
+// NewVOPRFClient creates a new verifiable OPRF client with the server's public key.
+// The public key enables clients to verify the server is using the correct OPRF key.
+func NewVOPRFClient(serverPublicKey *oprf.PublicKey) *VOPRFClient {
+	return &VOPRFClient{
+		client:    oprf.NewVerifiableClient(oprfSuite, serverPublicKey),
+		publicKey: serverPublicKey,
+	}
 }
 
 // NewOPRFClient creates a new OPRF client using Ristretto255.
+// Note: For full verifiability, use NewOPRFClientWithPublicKey instead.
 func NewOPRFClient() *OPRFClient {
-	return &OPRFClient{client: oprf.NewClient(oprfSuite)}
+	// Create with nil public key - will be set when SetServerPublicKey is called
+	return &OPRFClient{voprf: nil}
 }
 
-// NewOPRFServer creates a new OPRF server with the given private key.
+// NewOPRFClientWithPublicKey creates a verifiable OPRF client with server's public key.
+func NewOPRFClientWithPublicKey(serverPublicKey *oprf.PublicKey) *OPRFClient {
+	return &OPRFClient{voprf: NewVOPRFClient(serverPublicKey)}
+}
+
+// SetServerPublicKey configures the server's public key for verification.
+func (c *OPRFClient) SetServerPublicKey(publicKey *oprf.PublicKey) {
+	c.voprf = NewVOPRFClient(publicKey)
+}
+
+// NewOPRFServer creates a new OPRF server with the given private key in verifiable mode.
 func NewOPRFServer(privateKey *oprf.PrivateKey) *OPRFServer {
-	return &OPRFServer{server: oprf.NewServer(oprfSuite, privateKey)}
+	return &OPRFServer{server: oprf.NewVerifiableServer(oprfSuite, privateKey)}
 }
 
 // Suite returns the cipher suite identifier.
@@ -140,10 +176,10 @@ func ParseOPRFPublicKey(data []byte) (*oprf.PublicKey, error) {
 
 // Blind creates a blinded OPRF request.
 func (c *OPRFClient) Blind(input []byte) (*OPRFState, []byte, error) {
-	if c == nil {
-		return nil, nil, errors.New("oprf client is nil")
+	if c == nil || c.voprf == nil {
+		return nil, nil, errors.New("oprf client is nil or not initialized with public key")
 	}
-	fin, req, err := c.client.Blind([][]byte{input})
+	fin, req, err := c.voprf.client.Blind([][]byte{input})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,21 +187,24 @@ func (c *OPRFClient) Blind(input []byte) (*OPRFState, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return &OPRFState{finalize: fin}, wire, nil
+	return &OPRFState{finalize: fin, publicKey: c.voprf.publicKey}, wire, nil
 }
 
-// Finalize unblinds the server response to get the OPRF output.
+// Finalize unblinds the server response and verifies the OPRF proof.
+// In verifiable mode, this also checks that the server used the correct key.
 func (c *OPRFClient) Finalize(state *OPRFState, evalBytes []byte) ([]byte, error) {
-	if c == nil || state == nil || state.finalize == nil {
+	if c == nil || c.voprf == nil || state == nil || state.finalize == nil {
 		return nil, errors.New("oprf finalize state is nil")
 	}
-	eval, err := unmarshalEvaluation(evalBytes)
+	eval, err := unmarshalVerifiableEvaluation(evalBytes)
 	if err != nil {
 		return nil, err
 	}
-	outputs, err := c.client.Finalize(state.finalize, eval)
+	// Verifiable finalize - includes proof verification
+	outputs, err := c.voprf.client.Finalize(state.finalize, eval)
 	if err != nil {
-		return nil, err
+		// This will fail if the server's proof is invalid (wrong key, tampered response)
+		return nil, fmt.Errorf("VOPRF verification failed: %w", err)
 	}
 	if len(outputs) != 1 {
 		return nil, errors.New("unexpected oprf output count")
@@ -173,7 +212,8 @@ func (c *OPRFClient) Finalize(state *OPRFState, evalBytes []byte) ([]byte, error
 	return outputs[0], nil
 }
 
-// Evaluate computes the OPRF on a blinded input.
+// Evaluate computes the OPRF on a blinded input and generates a proof.
+// In verifiable mode, the proof allows clients to verify the server used the correct key.
 func (s *OPRFServer) Evaluate(requestBytes []byte) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("oprf server is nil")
@@ -182,11 +222,34 @@ func (s *OPRFServer) Evaluate(requestBytes []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Lock to protect against race in CIRCL's lazy public key initialization
+	s.mu.Lock()
 	eval, err := s.server.Evaluate(req)
+	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return marshalOPRFElements(eval.Elements)
+	// Marshal the evaluation with proof for verifiability
+	return marshalVerifiableEvaluation(eval)
+}
+
+// marshalVerifiableEvaluation serializes the evaluation including the DLEQ proof.
+func marshalVerifiableEvaluation(eval *oprf.Evaluation) ([]byte, error) {
+	elemBytes, err := marshalOPRFElements(eval.Elements)
+	if err != nil {
+		return nil, err
+	}
+	// Serialize the proof
+	proofBytes, err := eval.Proof.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("marshal VOPRF proof: %w", err)
+	}
+	// Format: elements || proofLen(2) || proof
+	out := make([]byte, len(elemBytes)+2+len(proofBytes))
+	copy(out, elemBytes)
+	binary.BigEndian.PutUint16(out[len(elemBytes):], uint16(len(proofBytes)))
+	copy(out[len(elemBytes)+2:], proofBytes)
+	return out, nil
 }
 
 func marshalOPRFElements(elements []oprf.Blinded) ([]byte, error) {
@@ -237,10 +300,57 @@ func unmarshalEvaluationRequest(data []byte) (*oprf.EvaluationRequest, error) {
 	return &oprf.EvaluationRequest{Elements: elements}, nil
 }
 
-func unmarshalEvaluation(data []byte) (*oprf.Evaluation, error) {
-	elements, err := unmarshalOPRFElements(data)
+// unmarshalVerifiableEvaluation deserializes an evaluation with DLEQ proof.
+func unmarshalVerifiableEvaluation(data []byte) (*oprf.Evaluation, error) {
+	if len(data) < 4 {
+		return nil, errors.New("verifiable evaluation too short")
+	}
+
+	// First, parse the elements length to know where elements end
+	elemCount := int(binary.BigEndian.Uint16(data[:2]))
+	elemLen := int(oprfSuite.Group().Params().CompressedElementLength)
+	elemTotalLen := 2 + elemCount*elemLen
+
+	if len(data) < elemTotalLen+2 {
+		return nil, errors.New("verifiable evaluation truncated")
+	}
+
+	elements, err := unmarshalOPRFElements(data[:elemTotalLen])
 	if err != nil {
 		return nil, err
 	}
-	return &oprf.Evaluation{Elements: elements, Proof: nil}, nil
+
+	// Parse proof length and proof
+	proofLen := int(binary.BigEndian.Uint16(data[elemTotalLen:]))
+	if len(data) != elemTotalLen+2+proofLen {
+		return nil, errors.New("verifiable evaluation proof length mismatch")
+	}
+
+	proofBytes := data[elemTotalLen+2:]
+	proof := &dleq.Proof{}
+	if err := proof.UnmarshalBinary(oprfSuite.Group(), proofBytes); err != nil {
+		return nil, fmt.Errorf("unmarshal VOPRF proof: %w", err)
+	}
+
+	return &oprf.Evaluation{Elements: elements, Proof: proof}, nil
+}
+
+// OPRFPrivateKey is a type alias for the underlying OPRF private key.
+type OPRFPrivateKey = oprf.PrivateKey
+
+// ComputeDirectOPRF computes the OPRF output F(key, input) directly without blinding.
+// This is used by the ingest pipeline to precompute OPRF outputs for known-bad hashes.
+// The output matches what a client would get from Finalize() for the same input.
+func (s *OPRFServer) ComputeDirectOPRF(input []byte) ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("oprf server is nil")
+	}
+	// Lock to protect against race in CIRCL's lazy public key initialization
+	s.mu.Lock()
+	output, err := s.server.FullEvaluate(input)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("OPRF full evaluate: %w", err)
+	}
+	return output, nil
 }

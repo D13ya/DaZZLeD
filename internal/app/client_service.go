@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	pb "github.com/D13ya/DaZZLeD/api/proto/v1"
@@ -23,7 +22,9 @@ var (
 )
 
 const (
-	supportedProofVersion = 1
+	// supportedProofVersion kept for legacy V1 compat, but we now prefer V2
+	supportedProofVersion   = 1
+	supportedProofVersionV2 = 2
 )
 
 // ClientConfig holds configuration for the client service.
@@ -35,6 +36,9 @@ type ClientConfig struct {
 	DeviceID []byte
 	// AttestationSecret is the key for signing attestations
 	AttestationSecret []byte
+	// OPRFPublicKey is the server's OPRF public key for VOPRF verification
+	// This MUST be provided to enable verifiable OPRF (prevents opaque-list attacks)
+	OPRFPublicKey []byte
 }
 
 // DefaultClientConfig returns sensible defaults.
@@ -57,37 +61,58 @@ type ClientService struct {
 	deviceID       []byte
 }
 
-func NewClientService(client pb.AuthorityServiceClient, recursionSteps int, mldsaPublicKey *mldsa65.PublicKey) *ClientService {
+// NewClientService creates a client service with OPRF public key for verifiable mode.
+// The oprfPublicKey is REQUIRED - without it, the client cannot verify server's OPRF key usage.
+func NewClientService(client pb.AuthorityServiceClient, recursionSteps int, mldsaPublicKey *mldsa65.PublicKey, oprfPublicKey []byte) (*ClientService, error) {
 	cfg := DefaultClientConfig()
+	cfg.RecursionSteps = recursionSteps
+	cfg.OPRFPublicKey = oprfPublicKey
 	return NewClientServiceWithConfig(client, mldsaPublicKey, cfg)
 }
 
 // NewClientServiceWithConfig creates a client service with explicit configuration.
-func NewClientServiceWithConfig(client pb.AuthorityServiceClient, mldsaPublicKey *mldsa65.PublicKey, cfg ClientConfig) *ClientService {
-	// If no device ID provided, generate one (in production, use secure enclave)
-	deviceID := cfg.DeviceID
-	if len(deviceID) == 0 {
-		deviceID, _ = crypto.GenerateDeviceID()
+func NewClientServiceWithConfig(client pb.AuthorityServiceClient, mldsaPublicKey *mldsa65.PublicKey, cfg ClientConfig) (*ClientService, error) {
+	// OPRF public key is REQUIRED for verifiable OPRF
+	if len(cfg.OPRFPublicKey) == 0 {
+		return nil, errors.New("OPRF public key is required for verifiable mode")
+	}
+	oprfPubKey, err := crypto.ParseOPRFPublicKey(cfg.OPRFPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OPRF public key: %w", err)
 	}
 
-	// If no attestation secret provided, derive one from device ID
+	// Device secret for attestation - MUST be provided from secure storage
+	// In production, this should come from secure enclave, HSM, or encrypted keychain
+	deviceSecret := cfg.DeviceID
+	if len(deviceSecret) == 0 {
+		// Generate ephemeral secret for this session (NOT recommended for production)
+		// Production deployments MUST provide a persistent device secret from secure storage
+		deviceSecret, _ = crypto.GenerateDeviceSecret()
+	}
+
+	// Attestation secret should be provided from secure storage, not derived from hardcoded keys
 	attestationSecret := cfg.AttestationSecret
 	if len(attestationSecret) == 0 {
-		// In production, this master key should come from secure storage
-		masterKey := []byte("dazzled-master-key-replace-in-production")
-		attestationSecret = crypto.DeriveAttestationSecret(masterKey, deviceID)
+		// In dev mode, use the well-known dev secret
+		if IsDevMode() && len(DevAttestationSecret) > 0 {
+			attestationSecret = DevAttestationSecret
+		} else {
+			// Use device secret directly as attestation secret
+			// In production, both should come from secure enclave
+			attestationSecret = deviceSecret
+		}
 	}
 
 	return &ClientService{
 		client:         client,
-		oprfClient:     crypto.NewOPRFClient(),
+		oprfClient:     crypto.NewOPRFClientWithPublicKey(oprfPubKey),
 		mldsaPublicKey: mldsaPublicKey,
 		recursionSteps: cfg.RecursionSteps,
 		epochMaxSkew:   cfg.EpochMaxSkew,
 		requestTimeout: cfg.RequestTimeout,
 		attestationCfg: crypto.NewAttestationConfig(attestationSecret),
-		deviceID:       deviceID,
-	}
+		deviceID:       deviceSecret, // Now stores device secret, not cleartext ID
+	}, nil
 }
 
 // ScanImage runs the end-to-end client flow with cryptographic verification.
@@ -97,11 +122,11 @@ func (s *ClientService) ScanImage(ctx context.Context, imagePath, modelVersion s
 	if err != nil {
 		return fmt.Errorf("load image: %w", err)
 	}
-	log.Printf("Loaded image: %d bytes", len(imgBytes))
+	// NOTE: Removed logging of image details to prevent sensitive audit trail
+	// that could reveal scan activity if logs are centralized
 
 	// Step 2: Generate recursive perceptual hash
 	hashVec := bridge.RecursiveInference(imgBytes, s.recursionSteps)
-	log.Printf("Generated hash vector: %d dimensions", len(hashVec))
 
 	// Step 3: Map to lattice point for crypto operations
 	latticePoint := bridge.MapToLattice(hashVec)
@@ -135,36 +160,26 @@ func (s *ClientService) ScanImage(ctx context.Context, imagePath, modelVersion s
 		return fmt.Errorf("%w: %v", ErrOPRFFailed, err)
 	}
 
-	// Step 8: Check for match (non-empty output indicates potential match)
-	if len(oprfOutput) == 0 {
-		log.Println("No match detected")
+	// Step 8: Check for match by verifying OPRF output against the set digest (Bloom filter)
+	// The membership proof (ML-DSA signature) was already verified in verifyServerResponse
+	isMatch := crypto.VerifyMembershipWithOPRF(oprfOutput, resp.ProofInstance)
+	if !isMatch {
+		// No match - return silently without logging scan details
 		return nil
 	}
 
-	log.Println("Potential match detected, uploading voucher share")
-
-	// Step 9: Generate and upload voucher share
+	// Step 9: Generate and upload voucher share (only on verified match)
 	return s.uploadVoucherShare(ctx, resp.UploadToken)
 }
 
 // verifyServerResponse performs all cryptographic verification steps.
 func (s *ClientService) verifyServerResponse(resp *pb.BlindCheckResponse) error {
-	// Check proof version compatibility
-	if resp.ProofVersion != supportedProofVersion {
-		return fmt.Errorf("%w: got %d, want %d", ErrProofVersionMismatch, resp.ProofVersion, supportedProofVersion)
-	}
-
-	// Verify epoch freshness (rollback protection)
+	// Verify epoch freshness first (rollback protection)
 	if !crypto.IsEpochFresh(resp.EpochId, time.Now(), s.epochMaxSkew) {
 		return ErrStaleEpoch
 	}
 
-	// Verify split accumulator structure
-	if !crypto.VerifySplitAccumulation(resp.ProofInstance, resp.MembershipProof) {
-		return ErrAccumulatorInvalid
-	}
-
-	// Parse and validate proof instance
+	// Parse and validate proof instance to determine version
 	version, epochFromProof, _, err := crypto.ParseProofInstance(resp.ProofInstance)
 	if err != nil {
 		return fmt.Errorf("parse proof instance: %w", err)
@@ -174,15 +189,33 @@ func (s *ClientService) verifyServerResponse(resp *pb.BlindCheckResponse) error 
 	if epochFromProof != resp.EpochId {
 		return fmt.Errorf("epoch mismatch: proof=%d, response=%d", epochFromProof, resp.EpochId)
 	}
-	log.Printf("Proof version=%d, epoch=%d", version, epochFromProof)
+
+	// Check proof version compatibility
+	if version != supportedProofVersion && version != supportedProofVersionV2 {
+		return fmt.Errorf("%w: got %d, want %d or %d", ErrProofVersionMismatch, version, supportedProofVersion, supportedProofVersionV2)
+	}
+
+	// For V2 proofs, verify the commitment signature (addresses "opaque list" criticism)
+	// This proves the authority approved this specific Bloom filter
+	if version == supportedProofVersionV2 {
+		if !crypto.VerifyProofInstanceSignature(s.mldsaPublicKey, resp.ProofInstance) {
+			return fmt.Errorf("commitment signature verification failed")
+		}
+	}
+
+	// Verify split accumulator structure (works for both V1 and V2)
+	if !crypto.VerifySplitAccumulation(resp.ProofInstance, resp.MembershipProof) {
+		return ErrAccumulatorInvalid
+	}
 
 	// Verify ML-DSA signature over the proof+signature payload
+	// This proves the server used the correct OPRF key for this request
 	sigPayload := crypto.ProofSignaturePayload(resp.ProofInstance, resp.BlindedSignature)
 	if !crypto.VerifyMLDSA(s.mldsaPublicKey, sigPayload, resp.MembershipProof) {
 		return ErrSignatureInvalid
 	}
 
-	log.Println("All cryptographic verifications passed")
+	// NOTE: Removed logging of verification status to prevent sensitive audit trails
 	return nil
 }
 
@@ -218,6 +251,6 @@ func (s *ClientService) uploadVoucherShare(ctx context.Context, uploadToken []by
 		return fmt.Errorf("share rejected: status=%v", resp.Status)
 	}
 
-	log.Println("Voucher share accepted")
+	// NOTE: Removed logging of voucher share status to prevent sensitive audit trails
 	return nil
 }

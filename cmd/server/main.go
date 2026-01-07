@@ -26,6 +26,7 @@ func main() {
 	port := flag.String("port", "50051", "listen port")
 	mldsaPrivPath := flag.String("mldsa-priv", "keys/mldsa_priv.bin", "path to ML-DSA private key")
 	oprfPrivPath := flag.String("oprf-priv", "keys/oprf_priv.bin", "path to OPRF private key")
+	attestSecretPath := flag.String("attest-secret", "keys/attest_secret.bin", "path to attestation verification secret")
 	tlsCert := flag.String("tls-cert", "", "path to server certificate (PEM)")
 	tlsKey := flag.String("tls-key", "", "path to server private key (PEM)")
 	tlsCA := flag.String("tls-ca", "", "path to CA bundle for client auth (PEM)")
@@ -41,6 +42,12 @@ func main() {
 		log.Fatalf("OPRF key load failed: %v", err)
 	}
 
+	// Load attestation secret for verifying device attestations
+	attestSecret, err := os.ReadFile(*attestSecretPath)
+	if err != nil {
+		log.Fatalf("attestation secret load failed: %v", err)
+	}
+
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
 		log.Fatalf("listen failed: %v", err)
@@ -54,7 +61,7 @@ func main() {
 	}
 
 	store := storage.NewBadgerStore()
-	service := app.NewServerService(crypto.NewOPRFServer(oprfKey), mldsaKey, store, 10*time.Minute)
+	service := app.NewServerService(crypto.NewOPRFServer(oprfKey), mldsaKey, store, 10*time.Minute, attestSecret)
 	handler := api.NewGRPCHandler(service)
 
 	grpcServer := grpc.NewServer(opts...)
