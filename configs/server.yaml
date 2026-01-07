@@ -1,0 +1,7 @@
+listen: ":50051"
+token_ttl: "10m"
+tls:
+  enabled: false
+  cert_path: ""
+  key_path: ""
+  client_ca_path: ""

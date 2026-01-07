@@ -1,0 +1,8 @@
+server: "localhost:50051"
+model_version: "TRM-v2-DINO"
+recursion_steps: 16
+tls:
+  enabled: false
+  ca_path: ""
+  cert_path: ""
+  key_path: ""

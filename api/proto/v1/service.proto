@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package recursive_safety.v1;
+
+option go_package = "github.com/D13ya/DaZZLeD/api/proto/v1;v1";
+
+// AuthorityService defines the server endpoints for the recursive safety protocol.
+service AuthorityService {
+  // Performs a blind, oblivious check of a content hash.
+  // Returns a blinded signature and a cryptographic proof of database integrity.
+  rpc CheckImage (BlindCheckRequest) returns (BlindCheckResponse);
+
+  // Uploads a threshold secret share if a match is detected.
+  // This endpoint is only called if the client verifies a positive match.
+  rpc UploadShare (VoucherShare) returns (ShareResponse);
+}
+
+// --- Request/Response Definitions ---
+
+message BlindCheckRequest {
+  // The client's blinded hash mapped to the crypto group.
+  // Format: Serialized Module-SIS vector (Lattice Element).
+  bytes blinded_element = 1;
+
+  // Metadata for model compatibility check.
+  string model_version = 2; // e.g. "TRM-v2-DINO"
+}
+
+message BlindCheckResponse {
+  // The server's signature on the blinded element.
+  // The client unblinds this to check for an intersection.
+  bytes blinded_signature = 1;
+
+  // The "Instance" part of the Split Accumulator.
+  // A constant-size commitment proving the server's key is valid.
+  bytes proof_instance = 2;
+
+  // A specific proof linking the 'blinded_signature' to the 'proof_instance'.
+  bytes membership_proof = 3;
+
+  // Epoch identifier for rollback protection (e.g., unix day or ledger height).
+  uint64 epoch_id = 4;
+
+  // Proof encoding version for forward compatibility.
+  uint32 proof_version = 5;
+
+  // Rate-limit token that must accompany UploadShare.
+  bytes upload_token = 6;
+}
+
+message VoucherShare {
+  // A single Shamir Secret Share derived from the content.
+  // Required: 't' unique shares to reconstruct the report.
+  bytes share_data = 1;
+
+  // An index indicating which share this is (e.g., 1 of 255).
+  uint32 share_index = 2;
+
+  // Encrypted metadata (timestamp, approximate location).
+  // Only decryptable if the threshold is met.
+  bytes encrypted_metadata = 3;
+
+  // The upload token the server issued in CheckImage (prevents spam).
+  bytes upload_token = 4;
+
+  // Device attestation blob for rate-limit/abuse controls.
+  bytes device_attestation = 5;
+}
+
+message ShareResponse {
+  enum Status {
+    UNKNOWN = 0;
+    ACCEPTED = 1; // Share stored successfully
+    REJECTED = 2; // Invalid share or rate limit exceeded
+  }
+  Status status = 1;
+}
