@@ -15,7 +15,6 @@ Key training features:
 import argparse
 import random
 from pathlib import Path
-import copy
 import sys
 
 import torch
@@ -91,36 +90,57 @@ class FlatImageDataset(Dataset):
             img = self.images[idx]
         else:
             img = Image.open(self.paths[idx]).convert("RGB")
+        
+        # Apply transform (handles both single-view and two-view)
         return self.transform(img)
 
 
-def build_transforms(image_size, teacher_name=None):
-    """Build transforms. If teacher_name is provided, use teacher's processor for normalization."""
-    # Get teacher's expected normalization if available
+class TwoViewTransform:
+    """
+    Wrapper that returns two augmented views of the same image.
+    Used for SimCLR-style contrastive learning.
+    """
+    def __init__(self, base_transform):
+        self.transform = base_transform
+    
+    def __call__(self, img):
+        view1 = self.transform(img)
+        view2 = self.transform(img)
+        return view1, view2
+
+
+def get_normalization_config(teacher_name=None):
+    """Get normalization mean/std - returns consistent values for training and eval."""
     if teacher_name:
         try:
             processor = AutoImageProcessor.from_pretrained(teacher_name, trust_remote_code=True)
-            mean = processor.image_mean
-            std = processor.image_std
+            mean = list(processor.image_mean)
+            std = list(processor.image_std)
             # Use teacher's expected size if available
+            image_size = 224
             if hasattr(processor, 'size'):
                 if isinstance(processor.size, dict):
-                    image_size = processor.size.get('shortest_edge', image_size)
+                    image_size = processor.size.get('shortest_edge', 224)
                 else:
                     image_size = processor.size
+            return mean, std, image_size
         except Exception:
-            # Fallback to ImageNet defaults
-            mean = [0.485, 0.456, 0.406]
-            std = [0.229, 0.224, 0.225]
-    else:
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
+            pass
+    # Fallback to ImageNet defaults
+    return [0.485, 0.456, 0.406], [0.229, 0.224, 0.225], 224
+
+
+def build_transforms(image_size, teacher_name=None, two_view=False):
+    """Build transforms. If teacher_name is provided, use teacher's processor for normalization."""
+    mean, std, teacher_size = get_normalization_config(teacher_name)
+    if teacher_size != 224:
+        image_size = teacher_size
     
     # Augmentations based on arXiv:2406.00918 findings:
     # - Rotation: PHAs vulnerable to rotation attacks (±15° provides robustness)
     # - Filtering: GaussianBlur helps with filter-based attacks
     # - Color/Crop: Standard augmentations for general robustness
-    return transforms.Compose([
+    base_transform = transforms.Compose([
         transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
         transforms.RandomRotation(15),  # ±15° rotation (arXiv:2406.00918)
         transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
@@ -129,6 +149,10 @@ def build_transforms(image_size, teacher_name=None):
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+    
+    if two_view:
+        return TwoViewTransform(base_transform), mean, std
+    return base_transform, mean, std
 
 
 def set_seed(seed):
@@ -166,8 +190,82 @@ class EMA:
         self.backup = {}
 
 
+def info_nce_loss(embeddings, temperature=0.07):
+    """
+    InfoNCE contrastive loss (in-batch negatives) - REPULSION ONLY.
+    
+    For a batch of N embeddings from different images, pushes them apart.
+    Used when we have single-view batch.
+    
+    Args:
+        embeddings: [B, D] normalized embeddings
+        temperature: τ, controls sharpness (lower = sharper)
+    
+    Returns:
+        Scalar loss (lower when different images are dissimilar)
+    """
+    # Similarity matrix [B, B]
+    sim_matrix = torch.mm(embeddings, embeddings.t()) / temperature
+    
+    # Labels: each sample is its own positive (diagonal)
+    batch_size = embeddings.size(0)
+    labels = torch.arange(batch_size, device=embeddings.device)
+    
+    # Cross-entropy: maximize diagonal, minimize off-diagonal
+    loss = F.cross_entropy(sim_matrix, labels)
+    
+    return loss
+
+
+def simclr_loss(z1, z2, temperature=0.07):
+    """
+    SimCLR contrastive loss with two views.
+    
+    For each image, we have two augmented views (z1, z2).
+    - Positive pairs: (z1[i], z2[i]) - same image, different augmentation
+    - Negative pairs: all other combinations
+    
+    This PULLS same-image pairs together AND PUSHES different images apart.
+    
+    Args:
+        z1: [B, D] normalized embeddings from view 1
+        z2: [B, D] normalized embeddings from view 2
+        temperature: τ, controls sharpness
+    
+    Returns:
+        Scalar loss
+    """
+    batch_size = z1.size(0)
+    
+    # Concatenate both views: [2B, D]
+    z = torch.cat([z1, z2], dim=0)
+    
+    # Similarity matrix: [2B, 2B]
+    sim_matrix = torch.mm(z, z.t()) / temperature
+    
+    # Mask out self-similarity (diagonal)
+    mask = torch.eye(2 * batch_size, device=z.device, dtype=torch.bool)
+    sim_matrix = sim_matrix.masked_fill(mask, -float('inf'))
+    
+    # Positive pairs: (i, i+B) and (i+B, i)
+    # For row i in [0, B): positive is at column i+B
+    # For row i in [B, 2B): positive is at column i-B
+    pos_indices = torch.cat([
+        torch.arange(batch_size, 2 * batch_size, device=z.device),
+        torch.arange(0, batch_size, device=z.device)
+    ])
+    
+    # InfoNCE: -log(exp(pos) / sum(exp(all)))
+    # = -pos + log(sum(exp(all)))
+    # = cross_entropy(sim_matrix, pos_indices)
+    loss = F.cross_entropy(sim_matrix, pos_indices)
+    
+    return loss
+
+
 def train_step_deep_supervision(
-    images,
+    view1,
+    view2,
     teacher,
     student,
     proj_head,
@@ -175,83 +273,112 @@ def train_step_deep_supervision(
     scaler,
     args,
     device,
+    effective_contrast_weight,
 ):
     """
-    TRM training with deep supervision.
+    TRM training with deep supervision + SimCLR contrastive loss (Option A).
     
-    Key differences from standard distillation:
-    1. Run N_sup supervision steps per batch
-    2. Compute loss at EACH step
-    3. Carry (y, z) across steps (detached between steps)
-    4. Accumulate losses and do ONE backward+step per batch
+    Loss function:
+        L = (1/N_sup) * Σ_{k=1}^{N_sup} L_align(y_k, teacher) 
+            + λ * L_SimCLR(y_N^1, y_N^2) / log(2B)
     
-    This avoids:
-    - Stale encoder outputs (x is in the accumulated graph)
-    - Scheduler/optimizer mismatch (one step per batch)
+    Key properties:
+    - Distillation at EVERY step k (core TRM deep supervision)
+    - SimCLR ONLY at final step N (on most refined hash)
+    - Contrast loss normalized by log(2B) for stable λ tuning
+    - Two augmented views per image (true SimCLR)
     """
-    batch_size = images.size(0)
+    batch_size = view1.size(0)
     use_amp = args.amp and device.type == "cuda"
     
     optimizer.zero_grad(set_to_none=True)
 
-    # Get teacher embedding (frozen, no grad)
+    # Get teacher embedding from view1 only (frozen, no grad)
+    # INTENTIONAL: Both augmented views align to the SAME teacher target.
+    # This enforces augmentation invariance - different crops/colors of the
+    # same image should produce the same hash (matching the teacher's view).
     with torch.no_grad():
         with torch.amp.autocast('cuda', enabled=use_amp):
-            teacher_out = teacher(images)
+            teacher_out = teacher(view1)
             teacher_emb = teacher_out.last_hidden_state[:, 0]  # [B, 1024]
 
-    # Project teacher embedding to hash space (WITH gradient - proj_head trains)
     with torch.amp.autocast('cuda', enabled=use_amp):
+        # Project teacher embedding to hash space
         target = F.normalize(proj_head(teacher_emb), dim=1)  # [B, hash_dim]
 
-        # Encode image (part of trainable graph)
-        x = student.image_encoder(images)
+        # Encode BOTH views
+        x1 = student.image_encoder(view1)
+        x2 = student.image_encoder(view2)
 
-        # Initialize y and z
-        y = student.y_init.expand(batch_size, -1).to(device)
-        z = student.z_init.expand(batch_size, -1).to(device)
+        # Initialize y and z for both views
+        y1 = student.y_init.expand(batch_size, -1).to(device)
+        z1 = student.z_init.expand(batch_size, -1).to(device)
+        y2 = student.y_init.expand(batch_size, -1).to(device)
+        z2 = student.z_init.expand(batch_size, -1).to(device)
 
-        accumulated_loss = 0.0
+        accumulated_align_loss = 0.0
         step_losses = []
 
-        # Deep supervision loop - accumulate losses
+        # Deep supervision loop
+        # L = Σ_k L_align(y_k, target) + λ * L_SimCLR(y_N^1, y_N^2)
         for _ in range(args.n_sup):
-            # Deep recursion: T-1 without grad, 1 with grad
+            # Deep recursion: T-1 without grad, 1 with grad (for both views)
             with torch.no_grad():
                 for _ in range(student.t - 1):
-                    y_tmp, z_tmp = student.latent_recursion(x, y, z)
-                    y, z = y_tmp, z_tmp
+                    y1, z1 = student.latent_recursion(x1, y1, z1)
+                    y2, z2 = student.latent_recursion(x2, y2, z2)
 
             # Final recursion with gradient
-            y_new, z_new = student.latent_recursion(x, y, z)
+            y1_new, z1_new = student.latent_recursion(x1, y1, z1)
+            y2_new, z2_new = student.latent_recursion(x2, y2, z2)
 
-            # Compute hash
-            hash_out = student.output_head(y_new)
-            hash_out = F.normalize(hash_out, p=2, dim=-1)
+            # Compute hashes for both views
+            hash1 = F.normalize(student.output_head(y1_new), p=2, dim=-1)
+            hash2 = F.normalize(student.output_head(y2_new), p=2, dim=-1)
 
-            # Loss: cosine similarity to teacher
-            step_loss = 1.0 - F.cosine_similarity(hash_out, target).mean()
-            accumulated_loss = accumulated_loss + step_loss
-            step_losses.append(step_loss.item())
+            # Loss 1: Alignment with teacher at EVERY step (core TRM deep supervision)
+            # Apply to BOTH views - each view should match the teacher embedding
+            align_loss1 = 1.0 - F.cosine_similarity(hash1, target).mean()
+            align_loss2 = 1.0 - F.cosine_similarity(hash2, target).mean()
+            align_loss = (align_loss1 + align_loss2) / 2.0  # Average over views
+            accumulated_align_loss = accumulated_align_loss + align_loss
+            step_losses.append(align_loss.item())
 
             # Carry forward (detached for next supervision step)
-            y = y_new.detach()
-            z = z_new.detach()
+            y1, z1 = y1_new.detach(), z1_new.detach()
+            y2, z2 = y2_new.detach(), z2_new.detach()
 
             # ACT: Early stopping if loss is very low
-            if args.use_act and step_loss.item() < 0.01:
+            if args.use_act and align_loss.item() < 0.01:
                 break
 
-        # Average the accumulated loss
+        # Loss 2: SimCLR contrastive loss ONLY at final step (on most refined hash)
+        # This is Option A: L = Σ_k L_align(y_k) + λ * L_SimCLR(y_N^1, y_N^2)
+        #
+        # LOSS SCALE NOTE:
+        # - align_loss ≈ 0.2-0.6 (cosine distance)
+        # - contrast_loss ≈ log(2B) ≈ 5-6 for B=192
+        # We normalize by log(2B) so λ is interpretable (λ=1 means equal weight)
+        if effective_contrast_weight > 0:
+            contrast_loss = simclr_loss(hash1, hash2, temperature=args.nce_temperature)
+            # Normalize by log(2B) to make λ more interpretable
+            log_2b = torch.log(torch.tensor(2.0 * batch_size, device=device))
+            contrast_loss_normalized = contrast_loss / log_2b
+        else:
+            contrast_loss_normalized = torch.tensor(0.0, device=device)
+            contrast_loss = torch.tensor(0.0, device=device)
+
+        # Total loss: deep supervision alignment + final-step contrastive
         n_steps = len(step_losses)
-        accumulated_loss = accumulated_loss / n_steps
+        total_loss = accumulated_align_loss / n_steps + effective_contrast_weight * contrast_loss_normalized
 
     # Single backward + step per batch
-    scaler.scale(accumulated_loss).backward()
+    scaler.scale(total_loss).backward()
     scaler.step(optimizer)
     scaler.update()
 
-    return sum(step_losses) / n_steps
+    # Return combined loss for logging (use same formula as training)
+    return (sum(step_losses) / n_steps) + effective_contrast_weight * contrast_loss_normalized.item()
 
 
 def _configure_backends(args, device):
@@ -264,9 +391,20 @@ def _configure_backends(args, device):
 
 
 def _create_dataloader(args):
-    """Create training dataloader."""
+    """Create training dataloader with two-view transform for SimCLR."""
     # Use teacher's preprocessing for correct normalization
-    transform = build_transforms(args.image_size, teacher_name=args.teacher)
+    # two_view=True returns TwoViewTransform that gives (view1, view2) per image
+    use_two_view = args.contrast_weight > 0
+    transform, mean, std = build_transforms(
+        args.image_size, 
+        teacher_name=args.teacher,
+        two_view=use_two_view
+    )
+    
+    # Store normalization config for eval consistency
+    args._norm_mean = mean
+    args._norm_std = std
+    
     dataset = FlatImageDataset(
         args.data,
         transform,
@@ -283,7 +421,7 @@ def _create_dataloader(args):
         pin_memory=args.pin_memory,
         persistent_workers=args.workers > 0,
         prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
-    )
+    ), use_two_view
 
 
 def _create_models(args, device):
@@ -337,18 +475,36 @@ def _create_optimizer_and_scheduler(args, student, proj_head):
     return optimizer, scheduler
 
 
-def _run_epoch(epoch, loader, teacher, student, proj_head, optimizer, scheduler, scaler, ema, args, device, global_step):
+def _run_epoch(epoch, loader, teacher, student, proj_head, optimizer, scheduler, scaler, ema, args, device, global_step, use_two_view):
     """Run one training epoch."""
     student.train()
     epoch_loss = 0.0
+    
+    # Contrast warmup: λ=0 for first N epochs
+    effective_contrast_weight = 0.0 if epoch < args.contrast_warmup_epochs else args.contrast_weight
+    if epoch == args.contrast_warmup_epochs and args.contrast_weight > 0:
+        print(f"  📈 Enabling SimCLR contrastive loss (λ={args.contrast_weight})")
 
-    for step, images in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True)
-        if args.channels_last and images.dim() == 4:
-            images = images.contiguous(memory_format=torch.channels_last)
+    for step, batch in enumerate(loader, start=1):
+        if use_two_view:
+            # batch is (view1, view2) tuple
+            view1, view2 = batch
+            view1 = view1.to(device, non_blocking=True)
+            view2 = view2.to(device, non_blocking=True)
+            if args.channels_last:
+                view1 = view1.contiguous(memory_format=torch.channels_last)
+                view2 = view2.contiguous(memory_format=torch.channels_last)
+        else:
+            # Single view (no contrastive loss)
+            view1 = batch.to(device, non_blocking=True)
+            view2 = view1  # Same view (SimCLR loss will be identity, but contrast_weight=0 anyway)
+            if args.channels_last and view1.dim() == 4:
+                view1 = view1.contiguous(memory_format=torch.channels_last)
+                view2 = view1
 
         loss = train_step_deep_supervision(
-            images, teacher, student, proj_head, optimizer, scaler, args, device
+            view1, view2, teacher, student, proj_head, optimizer, scaler, args, device,
+            effective_contrast_weight
         )
 
         scheduler.step()
@@ -363,7 +519,7 @@ def _run_epoch(epoch, loader, teacher, student, proj_head, optimizer, scheduler,
             print(f"epoch={epoch+1} step={step} loss={epoch_loss/step:.4f} lr={lr:.2e}")
 
         if args.checkpoint_dir and args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:
-            save_checkpoint(student, proj_head, ema, args.checkpoint_dir, f"student_step_{global_step}.safetensors")
+            save_checkpoint(student, proj_head, ema, args.checkpoint_dir, f"student_step_{global_step}.safetensors", args)
 
         if args.max_steps and global_step >= args.max_steps:
             break
@@ -376,7 +532,7 @@ def train(args):
     set_seed(args.seed)
     _configure_backends(args, device)
 
-    loader = _create_dataloader(args)
+    loader, use_two_view = _create_dataloader(args)
     teacher, student, proj_head = _create_models(args, device)
     optimizer, scheduler = _create_optimizer_and_scheduler(args, student, proj_head)
 
@@ -385,26 +541,29 @@ def train(args):
     ema = EMA(student, decay=args.ema_decay) if args.use_ema else None
 
     global_step = 0
-    print(f"\nStarting TRM training with deep supervision (N_sup={args.n_sup})...")
+    mode = "SimCLR two-view" if use_two_view else "single-view"
+    print(f"\nStarting TRM training with deep supervision (N_sup={args.n_sup}, mode={mode})...")
     print(f"Student params: {sum(p.numel() for p in student.parameters()):,}")
+    if hasattr(args, '_norm_mean'):
+        print(f"Normalization: mean={args._norm_mean}, std={args._norm_std}")
 
     for epoch in range(args.epochs):
         epoch_loss, global_step = _run_epoch(
             epoch, loader, teacher, student, proj_head,
-            optimizer, scheduler, scaler, ema, args, device, global_step
+            optimizer, scheduler, scaler, ema, args, device, global_step, use_two_view
         )
 
         if args.max_steps and global_step >= args.max_steps:
             break
 
         if args.checkpoint_dir:
-            save_checkpoint(student, proj_head, ema, args.checkpoint_dir, f"student_epoch_{epoch+1}.safetensors")
+            save_checkpoint(student, proj_head, ema, args.checkpoint_dir, f"student_epoch_{epoch+1}.safetensors", args)
 
         print(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss/len(loader):.4f}")
 
 
-def save_checkpoint(student, proj_head, ema, checkpoint_dir, name):
-    """Save student weights (optionally with EMA). proj_head is fixed, no need to save."""
+def save_checkpoint(student, proj_head, ema, checkpoint_dir, name, args=None):
+    """Save student weights (optionally with EMA) + normalization config for eval."""
     ckpt_path = Path(checkpoint_dir)
     ckpt_path.mkdir(parents=True, exist_ok=True)
     
@@ -417,6 +576,23 @@ def save_checkpoint(student, proj_head, ema, checkpoint_dir, name):
         ema.restore(student)
     else:
         safetensors.torch.save_model(student, student_out.as_posix())
+    
+    # Save normalization config for eval consistency
+    if args is not None and hasattr(args, '_norm_mean'):
+        import json
+        config = {
+            "norm_mean": args._norm_mean,
+            "norm_std": args._norm_std,
+            "hash_dim": args.hash_dim,
+            "embed_dim": args.embed_dim,
+            "n_layers": args.n_layers,
+            "n_latent": args.n_latent,
+            "t": args.t,
+            "image_size": args.image_size,
+        }
+        config_path = ckpt_path / "model_config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
 
 
 def main():
@@ -431,7 +607,7 @@ def main():
     # Model
     parser.add_argument("--teacher", default="facebook/dinov3-vitl16-pretrain-lvd1689m")
     parser.add_argument("--embed-dim", type=int, default=256, help="TRM embedding dimension")
-    parser.add_argument("--hash-dim", type=int, default=96, help="Output hash dimension")
+    parser.add_argument("--hash-dim", type=int, default=128, help="Output hash dimension (96=compact, 128=balanced, 192=high-cap)")
     parser.add_argument("--n-layers", type=int, default=2, help="TRM network layers (paper uses 2)")
     parser.add_argument("--n-latent", type=int, default=6, help="Latent recursion steps per cycle")
     parser.add_argument("--t", type=int, default=3, help="Number of cycles (T-1 no grad, 1 with grad)")
@@ -447,6 +623,12 @@ def main():
     parser.add_argument("--use-ema", action="store_true", help="Use EMA (recommended)")
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--use-act", action="store_true", help="Early stop supervision if loss low")
+    
+    # Contrastive loss (SimCLR NT-Xent) - applied only at final supervision step
+    # Loss is normalized by log(2B) so λ=1.0 means equal weight to align and contrast
+    parser.add_argument("--contrast-weight", type=float, default=0.3, help="λ for SimCLR (normalized, 0.1-0.5 recommended)")
+    parser.add_argument("--nce-temperature", type=float, default=0.07, help="SimCLR temperature τ (lower=sharper)")
+    parser.add_argument("--contrast-warmup-epochs", type=int, default=1, help="Epochs with λ=0 before enabling SimCLR")
 
     # Optimization
     parser.add_argument("--workers", type=int, default=2)

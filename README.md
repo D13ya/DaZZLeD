@@ -123,11 +123,10 @@ ml-core/
   models/
     dino_teacher.py            - DINOv3 teacher loader (utility)
     trm_hasher.py              - TRM perceptual hasher (main model)
-    recursive_student.py       - Legacy model (deprecated)
   training/
-    train_trm.py               - TRM training with deep supervision
-    train.py                   - Legacy training (deprecated)
-    export_onnx.py             - Legacy ONNX export (deprecated)
+    train_trm.py               - TRM training with deep supervision + ONNX export
+  notebooks/
+    test_model.ipynb           - Interactive testing, calibration, robustness analysis
 
 pkg/
   logger/

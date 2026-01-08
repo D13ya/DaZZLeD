@@ -82,9 +82,13 @@ class ImageEncoder(nn.Module):
     This replaces the input_embedding() function from TRM paper.
     
     Uses GroupNorm instead of BatchNorm for stable inference with small batches.
+    
+    Note: embed_dim must be divisible by 8 for GroupNorm(8, embed_dim).
     """
     def __init__(self, embed_dim: int):
         super().__init__()
+        # GroupNorm requires channels divisible by num_groups
+        assert embed_dim % 8 == 0, f"embed_dim ({embed_dim}) must be divisible by 8 for GroupNorm"
         # GroupNorm groups: 8 is a common choice that works well
         self.encoder = nn.Sequential(
             # Stage 1: 224 -> 112
