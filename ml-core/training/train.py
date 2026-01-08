@@ -4,6 +4,7 @@ from pathlib import Path
 
 import sys
 import torch
+import torch.nn as nn
 import safetensors.torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -137,18 +138,28 @@ def _create_dataloader(args, transform):
 
 
 def _create_models(args, device):
-    """Create teacher and student models."""
+    """Create teacher, student, and projection head."""
     teacher = AutoModel.from_pretrained(args.teacher, trust_remote_code=True).to(device)
     teacher.eval()
+    
+    # Get teacher embedding dimension from config
+    teacher_dim = teacher.config.hidden_size  # 1024 for ViT-L
 
     student = RecursiveHasher(state_dim=args.state_dim, hash_dim=args.hash_dim).to(device)
+    
+    # Projection head: maps teacher embedding (1024) → student hash dim (96)
+    # This is trained alongside the student so we compare in the same space
+    proj_head = nn.Sequential(
+        nn.Linear(teacher_dim, args.hash_dim),
+    ).to(device)
+    
     if args.channels_last and device.type == "cuda":
         student = student.to(memory_format=torch.channels_last)
     
     if args.resume:
         safetensors.torch.load_model(student, args.resume)
     
-    return teacher, student
+    return teacher, student, proj_head
 
 
 def _save_checkpoint(student, checkpoint_dir, name):
@@ -159,28 +170,34 @@ def _save_checkpoint(student, checkpoint_dir, name):
     safetensors.torch.save_model(student, out.as_posix())
 
 
-def _train_step(images, teacher, student, args, device):
+def _train_step(images, teacher, student, proj_head, args, device):
     """Run a single training step and return the loss."""
     use_amp = args.amp and device.type == "cuda"
     
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=use_amp):
             teacher_out = teacher(images)
-            target = F.normalize(teacher_out.last_hidden_state[:, 0], dim=1)
+            teacher_emb = teacher_out.last_hidden_state[:, 0]  # [B, 1024]
 
     state = torch.zeros(images.size(0), args.state_dim, device=device)
     with torch.cuda.amp.autocast(enabled=use_amp):
         for _ in range(args.recursion_steps):
             state, student_hash = student(images, state)
+        
+        # Project teacher embedding to student hash space and normalize
+        target = F.normalize(proj_head(teacher_emb), dim=1)  # [B, 96]
+        student_hash = F.normalize(student_hash, dim=1)      # [B, 96]
+        
         loss = 1.0 - F.cosine_similarity(student_hash, target).mean()
         loss = loss / args.grad_accum
 
     return loss
 
 
-def _train_epoch(epoch, loader, teacher, student, optimizer, scaler, args, device, global_step):
+def _train_epoch(epoch, loader, teacher, student, proj_head, optimizer, scaler, args, device, global_step):
     """Run training for one epoch and return updated global_step."""
     student.train()
+    proj_head.train()
     total_loss = 0.0
     
     for step, images in enumerate(loader, start=1):
@@ -188,7 +205,7 @@ def _train_epoch(epoch, loader, teacher, student, optimizer, scaler, args, devic
         if args.channels_last and images.dim() == 4:
             images = images.contiguous(memory_format=torch.channels_last)
 
-        loss = _train_step(images, teacher, student, args, device)
+        loss = _train_step(images, teacher, student, proj_head, args, device)
         scaler.scale(loss).backward()
         
         if step % args.grad_accum == 0:
@@ -218,15 +235,20 @@ def train(args):
 
     transform = build_transforms(args.image_size)
     loader = _create_dataloader(args, transform)
-    teacher, student = _create_models(args, device)
+    teacher, student, proj_head = _create_models(args, device)
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
+    # Train both student and projection head
+    optimizer = torch.optim.AdamW(
+        list(student.parameters()) + list(proj_head.parameters()),
+        lr=args.lr,
+        weight_decay=0.01
+    )
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     global_step = 0
     for epoch in range(args.epochs):
-        global_step = _train_epoch(epoch, loader, teacher, student, optimizer, scaler, args, device, global_step)
+        global_step = _train_epoch(epoch, loader, teacher, student, proj_head, optimizer, scaler, args, device, global_step)
         
         if args.max_steps and global_step >= args.max_steps:
             break
