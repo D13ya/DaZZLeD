@@ -116,8 +116,13 @@ def build_transforms(image_size, teacher_name=None):
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
     
+    # Augmentations based on arXiv:2406.00918 findings:
+    # - Rotation: PHAs vulnerable to rotation attacks (±15° provides robustness)
+    # - Filtering: GaussianBlur helps with filter-based attacks
+    # - Color/Crop: Standard augmentations for general robustness
     return transforms.Compose([
         transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+        transforms.RandomRotation(15),  # ±15° rotation (arXiv:2406.00918)
         transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
         transforms.RandomHorizontalFlip(),
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
