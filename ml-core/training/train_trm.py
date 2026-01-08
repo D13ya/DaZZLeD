@@ -95,7 +95,7 @@ class FlatImageDataset(Dataset):
 
 
 def build_transforms(image_size, teacher_name=None):
-    \"\"\"Build transforms. If teacher_name is provided, use teacher's processor for normalization.\"\"\"
+    """Build transforms. If teacher_name is provided, use teacher's processor for normalization."""
     # Get teacher's expected normalization if available
     if teacher_name:
         try:
