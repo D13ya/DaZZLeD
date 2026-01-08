@@ -80,25 +80,28 @@ class ImageEncoder(nn.Module):
     """
     Lightweight CNN to convert image to embedding space.
     This replaces the input_embedding() function from TRM paper.
+    
+    Uses GroupNorm instead of BatchNorm for stable inference with small batches.
     """
     def __init__(self, embed_dim: int):
         super().__init__()
+        # GroupNorm groups: 8 is a common choice that works well
         self.encoder = nn.Sequential(
             # Stage 1: 224 -> 112
             nn.Conv2d(3, 32, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             nn.GELU(),
             # Stage 2: 112 -> 56
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.GELU(),
             # Stage 3: 56 -> 28
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.GELU(),
             # Stage 4: 28 -> 7
             nn.Conv2d(128, embed_dim, kernel_size=3, stride=4, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
+            nn.GroupNorm(8, embed_dim),
             nn.GELU(),
             # Global pool
             nn.AdaptiveAvgPool2d((1, 1)),
@@ -134,13 +137,13 @@ class TRMHasher(nn.Module):
         hash_dim: int = 96,
         n_layers: int = 2,
         n_latent: int = 6,
-        T: int = 3,
+        t: int = 3,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.hash_dim = hash_dim
         self.n_latent = n_latent
-        self.T = T
+        self.t = t
 
         # Image encoder: image -> x embedding
         self.image_encoder = ImageEncoder(embed_dim)
@@ -172,7 +175,6 @@ class TRMHasher(nn.Module):
         """
         # Latent reasoning: update z n times
         for _ in range(self.n_latent):
-            # z = net(x, y, z)
             xyz = torch.cat([x, y, z], dim=-1)
             z = self.net(self.proj_xyz(xyz))
 
@@ -191,7 +193,7 @@ class TRMHasher(nn.Module):
         """
         # T-1 cycles without gradients
         with torch.no_grad():
-            for _ in range(self.T - 1):
+            for _ in range(self.t - 1):
                 y, z = self.latent_recursion(x, y, z)
 
         # Final cycle with gradients
@@ -242,23 +244,23 @@ class TRMHasher(nn.Module):
         batch_size = img.size(0)
         device = img.device
 
-        # Encode image once (reused across all supervision steps)
-        x = self.image_encoder(img)
-
-        # Initialize
-        y = self.y_init.expand(batch_size, -1).to(device)
-        z = self.z_init.expand(batch_size, -1).to(device)
-
-        # Run N_sup supervision steps
         with torch.no_grad():
+            # Encode image once (reused across all supervision steps)
+            x = self.image_encoder(img)
+
+            # Initialize
+            y = self.y_init.expand(batch_size, -1).to(device)
+            z = self.z_init.expand(batch_size, -1).to(device)
+
+            # Run N_sup supervision steps
             for _ in range(n_sup):
                 # Deep recursion (all T cycles without grad at inference)
-                for _ in range(self.T):
+                for _ in range(self.t):
                     y, z = self.latent_recursion(x, y, z)
 
-        # Final hash
-        hash_out = self.output_head(y)
-        hash_out = F.normalize(hash_out, p=2, dim=-1)
+            # Final hash
+            hash_out = self.output_head(y)
+            hash_out = F.normalize(hash_out, p=2, dim=-1)
 
         return hash_out
 
@@ -291,7 +293,7 @@ class TRMHasherONNX(nn.Module):
         self.proj_yz = trm_hasher.proj_yz
         self.output_head = trm_hasher.output_head
         self.n_latent = trm_hasher.n_latent
-        self.T = trm_hasher.T
+        self.t = trm_hasher.t
         
         # Register y_init and z_init as buffers (not parameters) for ONNX
         self.register_buffer('y_init', trm_hasher.y_init.data.clone())
@@ -340,7 +342,7 @@ class TRMHasherONNX(nn.Module):
         x = mask * x_cached + (1 - mask) * x
         
         # Run T cycles of latent recursion
-        for _ in range(self.T):
+        for _ in range(self.t):
             y, z = self.latent_recursion_step(x, y, z)
         
         # Compute hash
@@ -371,16 +373,16 @@ class RecursiveHasher(nn.Module):
         self.state_dim = state_dim
         self.hash_dim = hash_dim
         
-        # Simple CNN encoder
+        # Simple CNN encoder with GroupNorm for stable inference
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, 7, stride=2, padding=3),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             nn.GELU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.GELU(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.GELU(),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
