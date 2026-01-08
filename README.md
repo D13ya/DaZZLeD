@@ -121,11 +121,13 @@ internal/
 ml-core/
   requirements.txt             - Python training dependencies
   models/
-    dino_teacher.py            - DINOv3 teacher loader
-    recursive_student.py       - Tiny recursive student model
+    dino_teacher.py            - DINOv3 teacher loader (utility)
+    trm_hasher.py              - TRM perceptual hasher (main model)
+    recursive_student.py       - Legacy model (deprecated)
   training/
-    export_onnx.py             - ONNX export script
-    train.py                   - Distillation training loop
+    train_trm.py               - TRM training with deep supervision
+    train.py                   - Legacy training (deprecated)
+    export_onnx.py             - Legacy ONNX export (deprecated)
 
 pkg/
   logger/
@@ -232,10 +234,10 @@ print("cuda:", torch.cuda.is_available())
 PY
 
 # Point to a single staged dataset root (merge FFHQ/OpenImages/Text under one folder)
-python training/train.py \--data ../data/ffhq/224 \--teacher facebook/dinov3-vit-large-14 \--epochs 5 \--checkpoint-dir ./checkpoints  
+python training/train_trm.py \--data ../data/ffhq/224 \--teacher facebook/dinov3-vitl16-pretrain-lvd1689m \--epochs 5 \--n-sup 16 \--use-ema \--amp \--checkpoint-dir ./checkpoints
 
-# Export ONNX from a safetensors checkpoint
-python training/export\_onnx.py \--checkpoint ./checkpoints/student_epoch_5.safetensors \--output ./models/trm\_v1.onnx
+# Export ONNX: Use the Colab notebook (test_model.ipynb) Cell 6 for ONNX export
+# The TRM model exports with inputs: image, y, z, x_cached
 
 PowerShell (Windows)
 
@@ -248,8 +250,9 @@ pip install -r requirements.txt
 # Optional sanity check (CUDA should be True on GPU machines)
 python -c "import torch; print('cuda:', torch.cuda.is_available())"
 
-python training\train.py --data ..\data\ffhq\224 --teacher facebook/dinov3-vit-large-14 --epochs 5 --checkpoint-dir .\checkpoints
-python training\export_onnx.py --checkpoint .\checkpoints\student_epoch_5.safetensors --output .\models\trm_v1.onnx
+python training\train_trm.py --data ..\data\ffhq\224 --teacher facebook/dinov3-vitl16-pretrain-lvd1689m --epochs 5 --n-sup 16 --use-ema --amp --checkpoint-dir .\checkpoints
+
+# Export ONNX: Use the Colab notebook (test_model.ipynb) for ONNX export
 ```
 
 ### **1\.1 Train in Google Colab (Recommended for GPU)**
@@ -257,16 +260,16 @@ python training\export_onnx.py --checkpoint .\checkpoints\student_epoch_5.safete
 If your local machine has no GPU, use Colab. A full walk‑through (including A100 profile settings) is in `ml-core/COLAB.md`. Example Colab command:
 
 ```python
-!python training/train.py \
-  --data /content/drive/MyDrive/dazzled/data/combined \
-  --teacher facebook/dinov3-vit-large-14 \
-  --epochs 3 \
-  --batch-size 8 \
-  --grad-accum 2 \
+!python training/train_trm.py \
+  --data-list /content/drive/MyDrive/dazzled/manifests/train.txt \
+  --teacher facebook/dinov3-vitl16-pretrain-lvd1689m \
+  --epochs 5 \
+  --batch-size 256 \
+  --n-sup 16 \
+  --use-ema \
   --amp \
-  --checkpoint-dir ./checkpoints \
-  --checkpoint-every 200 \
-  --max-steps 1000
+  --allow-tf32 \
+  --checkpoint-dir /content/drive/MyDrive/dazzled/outputs/checkpoints
 ```
 
 ### **1\.4 Install Proto Toolchain**
