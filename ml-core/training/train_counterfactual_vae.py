@@ -64,10 +64,20 @@ class DomainImageDataset(Dataset):
         self.raw_domains = list(raw_domains)
         self.transform = transform
         self.cache_ram = cache_ram
-        self.images = [None] * len(self.paths)
         self.domain_map = {}
         self.domain_ids = self._encode_domains(self.raw_domains)
         self.num_domains = len(self.domain_map)
+        unknown = [i for i, d in enumerate(self.domain_ids) if d < 0]
+        if unknown:
+            keep = [i for i, d in enumerate(self.domain_ids) if d >= 0]
+            removed = len(self.domain_ids) - len(keep)
+            self.paths = [self.paths[i] for i in keep]
+            self.raw_domains = [self.raw_domains[i] for i in keep]
+            self.domain_ids = [self.domain_ids[i] for i in keep]
+            print(f"Filtered {removed} unlabeled domain samples; {len(self.domain_ids)} remain.")
+            if not self.domain_ids:
+                raise ValueError("No labeled domains remain after filtering. Check --domain-regex.")
+        self.images = [None] * len(self.paths)
         if self.cache_ram:
             self._cache_images()
 
