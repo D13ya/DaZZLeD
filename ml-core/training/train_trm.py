@@ -167,18 +167,22 @@ def build_ghost_centers(num_centers: int, hash_dim: int, device: torch.device, s
     return (vec > 0.5).float().to(device)
 
 
-def _center_loss_and_indices(hash_batch, labels_valid, centers, center_mode):
+def _center_loss_and_indices(hash_logits, labels_valid, centers, center_mode):
     if center_mode == "random":
         unique_labels, inv = torch.unique(labels_valid, return_inverse=True, dim=0)
-        centers_unique = _random_centers_for_labels(unique_labels.cpu(), hash_batch.size(1), hash_batch.device)
+        centers_unique = _random_centers_for_labels(unique_labels.cpu(), hash_logits.size(1), hash_logits.device)
         centers_for_batch = centers_unique[inv]
-        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+        center_loss = F.binary_cross_entropy_with_logits(
+            hash_logits, centers_for_batch, reduction="none",
+        ).mean()
         return center_loss, inv, centers_unique
     if centers is None:
         return None, None, None
     labels_mod = labels_valid % centers.size(0)
     centers_for_batch = centers[labels_mod]
-    center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+    center_loss = F.binary_cross_entropy_with_logits(
+        hash_logits, centers_for_batch, reduction="none",
+    ).mean()
     return center_loss, labels_mod, centers
 
 
@@ -196,7 +200,7 @@ def _sample_negative_indices(label_indices, num_centers: int, neg_k: int, device
     return torch.stack(neg_indices, dim=0)
 
 
-def _distinct_center_loss(hash_batch, label_indices, centers_for_neg, neg_k: int, ghost_centers):
+def _distinct_center_loss(hash_logits, label_indices, centers_for_neg, neg_k: int, ghost_centers):
     num_centers = centers_for_neg.size(0)
     if num_centers <= 1:
         neg_k = 0
@@ -205,17 +209,21 @@ def _distinct_center_loss(hash_batch, label_indices, centers_for_neg, neg_k: int
 
     neg_losses = []
     if neg_k > 0:
-        neg_indices = _sample_negative_indices(label_indices, num_centers, neg_k, hash_batch.device)
+        neg_indices = _sample_negative_indices(label_indices, num_centers, neg_k, hash_logits.device)
         neg_centers = centers_for_neg[neg_indices]
-        hash_exp = hash_batch.unsqueeze(1).expand(-1, neg_k, -1)
-        neg_loss = F.binary_cross_entropy(hash_exp, neg_centers, reduction="none").mean(dim=2)
+        logits_exp = hash_logits.unsqueeze(1).expand(-1, neg_k, -1)
+        neg_loss = F.binary_cross_entropy_with_logits(
+            logits_exp, neg_centers, reduction="none",
+        ).mean(dim=2)
         neg_losses.append(neg_loss)
 
     if ghost_centers is not None and ghost_centers.numel() > 0:
-        ghost_centers = ghost_centers.to(hash_batch.device)
-        ghost_exp = hash_batch.unsqueeze(1).expand(-1, ghost_centers.size(0), -1)
-        ghost_targets = ghost_centers.unsqueeze(0).expand(hash_batch.size(0), -1, -1)
-        ghost_loss = F.binary_cross_entropy(ghost_exp, ghost_targets, reduction="none").mean(dim=2)
+        ghost_centers = ghost_centers.to(hash_logits.device)
+        ghost_exp = hash_logits.unsqueeze(1).expand(-1, ghost_centers.size(0), -1)
+        ghost_targets = ghost_centers.unsqueeze(0).expand(hash_logits.size(0), -1, -1)
+        ghost_loss = F.binary_cross_entropy_with_logits(
+            ghost_exp, ghost_targets, reduction="none",
+        ).mean(dim=2)
         neg_losses.append(ghost_loss)
 
     if not neg_losses:
@@ -226,14 +234,14 @@ def _distinct_center_loss(hash_batch, label_indices, centers_for_neg, neg_k: int
 
 
 def hash_center_losses(
-    hash_batch,
+    hash_logits,
     labels,
     centers,
     neg_k: int,
     center_mode: str,
     ghost_centers: torch.Tensor | None,
 ):
-    """Compute L_C and L_D for hash centers. Returns (center_loss, distinct_loss)."""
+    """Compute L_C and L_D for hash centers from logits; returns (center_loss, distinct_loss)."""
     if labels is None:
         return 0.0, 0.0
     labels = labels.long()
@@ -243,17 +251,17 @@ def hash_center_losses(
 
     labels = labels.clone()
     labels[labels < 0] = 0
-    hash_batch = hash_batch[valid]
+    hash_logits = hash_logits[valid]
     labels_valid = labels[valid]
 
     center_loss, label_indices, centers_for_neg = _center_loss_and_indices(
-        hash_batch, labels_valid, centers, center_mode,
+        hash_logits, labels_valid, centers, center_mode,
     )
     if center_loss is None:
         return 0.0, 0.0
 
     distinct_loss = _distinct_center_loss(
-        hash_batch, label_indices, centers_for_neg, neg_k, ghost_centers,
+        hash_logits, label_indices, centers_for_neg, neg_k, ghost_centers,
     )
 
     return center_loss, distinct_loss
@@ -513,9 +521,11 @@ def _run_two_view_recursion(student, x1, x2, y1, z1, y2, z2, detach_input: bool)
 
     y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
     y2_new, z2_new = student.latent_recursion(x2, y2_curr, z2_curr)
-    hash1 = torch.sigmoid(student.output_head(y1_new))
-    hash2 = torch.sigmoid(student.output_head(y2_new))
-    return y1_new, z1_new, y2_new, z2_new, hash1, hash2
+    hash1_logits = student.output_head(y1_new)
+    hash2_logits = student.output_head(y2_new)
+    hash1 = torch.sigmoid(hash1_logits)
+    hash2 = torch.sigmoid(hash2_logits)
+    return y1_new, z1_new, y2_new, z2_new, hash1, hash2, hash1_logits, hash2_logits
 
 
 def _run_single_view_recursion(student, x1, y1, z1, detach_input: bool):
@@ -527,11 +537,12 @@ def _run_single_view_recursion(student, x1, y1, z1, detach_input: bool):
             y1_curr, z1_curr = student.latent_recursion(x1_step, y1_curr, z1_curr)
 
     y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
-    hash1 = torch.sigmoid(student.output_head(y1_new))
-    return y1_new, z1_new, hash1
+    hash1_logits = student.output_head(y1_new)
+    hash1 = torch.sigmoid(hash1_logits)
+    return y1_new, z1_new, hash1, hash1_logits
 
 
-def _apply_center_distinct_losses_two_view(hash1, hash2, ctx: TrainStepContext):
+def _apply_center_distinct_losses_two_view(hash1_logits, hash2_logits, ctx: TrainStepContext):
     align_loss = torch.zeros((), device=ctx.device)
     step_loss = torch.zeros((), device=ctx.device)
     center_loss_val = 0.0
@@ -541,10 +552,10 @@ def _apply_center_distinct_losses_two_view(hash1, hash2, ctx: TrainStepContext):
         return align_loss, step_loss, center_loss_val, distinct_loss_val
 
     c1, d1 = hash_center_losses(
-        hash1, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+        hash1_logits, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
     )
     c2, d2 = hash_center_losses(
-        hash2, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+        hash2_logits, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
     )
     center_loss = 0.5 * (c1 + c2)
     distinct_loss = 0.5 * (d1 + d2)
@@ -560,7 +571,7 @@ def _apply_center_distinct_losses_two_view(hash1, hash2, ctx: TrainStepContext):
     return align_loss, step_loss, center_loss_val, distinct_loss_val
 
 
-def _apply_center_distinct_losses_single_view(hash1, ctx: TrainStepContext):
+def _apply_center_distinct_losses_single_view(hash1_logits, ctx: TrainStepContext):
     align_loss = torch.zeros((), device=ctx.device)
     step_loss = torch.zeros((), device=ctx.device)
     center_loss_val = 0.0
@@ -570,7 +581,7 @@ def _apply_center_distinct_losses_single_view(hash1, ctx: TrainStepContext):
         return align_loss, step_loss, center_loss_val, distinct_loss_val
 
     center_loss, distinct_loss = hash_center_losses(
-        hash1, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+        hash1_logits, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
     )
     align_loss = center_loss
     if ctx.args.center_weight > 0:
@@ -663,12 +674,12 @@ def train_step_trainable_two_view(view1, view2, student, ctx: TrainStepContext):
             x1 = student.image_encoder(view1)
             x2 = student.image_encoder(view2)
 
-            y1_new, z1_new, y2_new, z2_new, hash1, hash2 = _run_two_view_recursion(
+            y1_new, z1_new, y2_new, z2_new, hash1, hash2, hash1_logits, hash2_logits = _run_two_view_recursion(
                 student, x1, x2, y1, z1, y2, z2, detach_input=True,
             )
 
             align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_two_view(
-                hash1, hash2, ctx,
+                hash1_logits, hash2_logits, ctx,
             )
             step_loss, quant_loss_val = _apply_quant_loss_two_view(step_loss, hash1, hash2, ctx.args)
 
@@ -732,12 +743,12 @@ def train_step_frozen_two_view(view1, view2, student, ctx: TrainStepContext):
         ctx.runtime.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            y1_new, z1_new, y2_new, z2_new, hash1, hash2 = _run_two_view_recursion(
+            y1_new, z1_new, y2_new, z2_new, hash1, hash2, hash1_logits, hash2_logits = _run_two_view_recursion(
                 student, x1, x2, y1, z1, y2, z2, detach_input=False,
             )
 
             align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_two_view(
-                hash1, hash2, ctx,
+                hash1_logits, hash2_logits, ctx,
             )
             step_loss, quant_loss_val = _apply_quant_loss_two_view(step_loss, hash1, hash2, ctx.args)
 
@@ -805,12 +816,12 @@ def train_step_single_view(view1, student, ctx: TrainStepContext):
             if not freeze_encoder:
                 x1 = student.image_encoder(view1)
 
-            y1_new, z1_new, hash1 = _run_single_view_recursion(
+            y1_new, z1_new, hash1, hash1_logits = _run_single_view_recursion(
                 student, x1, y1, z1, detach_input,
             )
 
             align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_single_view(
-                hash1, ctx,
+                hash1_logits, ctx,
             )
             step_loss, quant_loss_val = _apply_quant_loss_single_view(step_loss, hash1, ctx.args)
 
