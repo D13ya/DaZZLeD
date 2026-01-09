@@ -232,8 +232,18 @@ import torch
 print("cuda:", torch.cuda.is_available())
 PY
 
-# Point to a single staged dataset root (merge FFHQ/OpenImages/Text under one folder)
-python training/train_trm.py \--data ../data/ffhq/224 \--teacher facebook/dinov3-vitl16-pretrain-lvd1689m \--epochs 5 \--n-sup 16 \--use-ema \--amp \--checkpoint-dir ./checkpoints
+# For hash-center training, use a manifest and extract image_id labels via regex.
+# This regex matches: 00000.jpg, ffhq_00000.jpg, openimages_00000.jpg, openimg_00000.jpg, mobileview_00000.jpg
+python training/train_trm.py \
+  --data-list ../data/manifests/train.txt \
+  --label-mode list \
+  --label-regex '^((?:ffhq|openimages|openimg|mobileview)_\d+|\d+)' \
+  --teacher facebook/dinov3-vitl16-pretrain-lvd1689m \
+  --epochs 5 \
+  --n-sup 16 \
+  --use-ema \
+  --amp \
+  --checkpoint-dir ./checkpoints
 
 # Export ONNX: Use the Colab notebook (test_model.ipynb) Cell 6 for ONNX export
 # The TRM model exports with inputs: image, y, z, x_cached
@@ -249,7 +259,7 @@ pip install -r requirements.txt
 # Optional sanity check (CUDA should be True on GPU machines)
 python -c "import torch; print('cuda:', torch.cuda.is_available())"
 
-python training\train_trm.py --data ..\data\ffhq\224 --teacher facebook/dinov3-vitl16-pretrain-lvd1689m --epochs 5 --n-sup 16 --use-ema --amp --checkpoint-dir .\checkpoints
+python training\train_trm.py --data-list ..\data\manifests\train.txt --label-mode list --label-regex '^((?:ffhq|openimages|openimg|mobileview)_\d+|\d+)' --teacher facebook/dinov3-vitl16-pretrain-lvd1689m --epochs 5 --n-sup 16 --use-ema --amp --checkpoint-dir .\checkpoints
 
 # Export ONNX: Use the Colab notebook (test_model.ipynb) for ONNX export
 ```
@@ -261,6 +271,8 @@ If your local machine has no GPU, use Colab. A full walk‑through (including A1
 ```python
 !python training/train_trm.py \
   --data-list /content/drive/MyDrive/dazzled/manifests/train.txt \
+  --label-mode list \
+  --label-regex '^((?:ffhq|openimages|openimg|mobileview)_\d+|\d+)' \
   --teacher facebook/dinov3-vitl16-pretrain-lvd1689m \
   --epochs 5 \
   --batch-size 256 \

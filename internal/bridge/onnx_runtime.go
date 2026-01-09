@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	HashDim        = 96
+	HashDim        = 128
 	StateDim       = 128
 	DefaultSteps   = 16
 	DefaultImgSize = 224
