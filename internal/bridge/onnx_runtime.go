@@ -232,11 +232,9 @@ func simulateInferenceStep(image, state []float32, step, hashDim int) ([]float32
 
 	hash := make([]float32, hashDim)
 	for i := range hash {
-		hash[i] = (float32(sum[(i+16)%len(sum)]) / 127.5) - 1.0
+		hash[i] = float32(sum[(i+16)%len(sum)]) / 255.0
 	}
 
-	// L2 normalize hash
-	hash = normalizeL2(hash)
 	return newState, hash
 }
 
@@ -342,7 +340,7 @@ func RecursiveInference(image []byte, steps int) []float32 {
 	return placeholderHash(image, steps, HashDim)
 }
 
-// placeholderHash generates a deterministic hash for testing.
+// placeholderHash generates a deterministic sigmoid-like hash in [0,1] for testing.
 func placeholderHash(image []byte, steps, hashDim int) []float32 {
 	state := sha256.Sum256(image)
 	for i := 0; i < steps; i++ {
@@ -353,8 +351,8 @@ func placeholderHash(image []byte, steps, hashDim int) []float32 {
 	out := make([]float32, hashDim)
 	for i := range out {
 		b := state[i%len(state)]
-		out[i] = (float32(b) / 127.5) - 1.0
+		out[i] = float32(b) / 255.0
 	}
 
-	return normalizeL2(out)
+	return out
 }

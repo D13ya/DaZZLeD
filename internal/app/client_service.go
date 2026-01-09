@@ -125,8 +125,10 @@ func (s *ClientService) ScanImage(ctx context.Context, imagePath, modelVersion s
 	// NOTE: Removed logging of image details to prevent sensitive audit trail
 	// that could reveal scan activity if logs are centralized
 
-	// Step 2: Generate recursive perceptual hash
+	// Step 2: Generate recursive perceptual hash (sigmoid outputs in [0,1])
 	hashVec := bridge.RecursiveInference(imgBytes, s.recursionSteps)
+	// Binarize for PSI path (strict hash bits at threshold 0.5)
+	hashVec = bridge.BinarizeHash(hashVec)
 
 	// Step 3: Map to lattice point for crypto operations
 	latticePoint := bridge.MapToLattice(hashVec)

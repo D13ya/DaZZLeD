@@ -30,7 +30,7 @@ import safetensors.torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
-from transformers import AutoModel, AutoImageProcessor
+from transformers import AutoImageProcessor
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
@@ -142,9 +142,40 @@ def build_hash_centers(num_centers: int, hash_dim: int, device: torch.device, se
     return centers
 
 
-def hash_center_losses(hash_batch, labels, centers, neg_k: int):
+def _label_seed(label: int) -> int:
+    digest = hashlib.sha256(str(label).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big", signed=False)
+
+
+def _random_centers_for_labels(labels: torch.Tensor, hash_dim: int, device: torch.device) -> torch.Tensor:
+    centers = []
+    for label in labels.tolist():
+        g = torch.Generator()
+        g.manual_seed(_label_seed(int(label)))
+        vec = torch.rand(hash_dim, generator=g)
+        centers.append((vec > 0.5).float())
+    return torch.stack(centers, dim=0).to(device)
+
+
+def build_ghost_centers(num_centers: int, hash_dim: int, device: torch.device, seed: int) -> torch.Tensor:
+    if num_centers <= 0:
+        return torch.empty((0, hash_dim), device=device)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    vec = torch.rand((num_centers, hash_dim), generator=g)
+    return (vec > 0.5).float().to(device)
+
+
+def hash_center_losses(
+    hash_batch,
+    labels,
+    centers,
+    neg_k: int,
+    center_mode: str,
+    ghost_centers: torch.Tensor | None,
+):
     """Compute L_C and L_D for hash centers. Returns (center_loss, distinct_loss)."""
-    if labels is None or centers is None:
+    if labels is None:
         return 0.0, 0.0
     labels = labels.long()
     valid = labels >= 0
@@ -153,39 +184,62 @@ def hash_center_losses(hash_batch, labels, centers, neg_k: int):
 
     labels = labels.clone()
     labels[labels < 0] = 0
-    labels = labels % centers.size(0)
-    centers_for_batch = centers[labels]
-
     hash_batch = hash_batch[valid]
-    centers_for_batch = centers_for_batch[valid]
+    labels_valid = labels[valid]
 
-    center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+    if center_mode == "random":
+        unique_labels, inv = torch.unique(labels_valid, return_inverse=True)
+        centers_unique = _random_centers_for_labels(unique_labels.cpu(), hash_batch.size(1), hash_batch.device)
+        centers_for_batch = centers_unique[inv]
+        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+        num_centers = centers_unique.size(0)
+        label_indices = inv
+    else:
+        if centers is None:
+            return 0.0, 0.0
+        labels_mod = labels_valid % centers.size(0)
+        centers_for_batch = centers[labels_mod]
+        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+        num_centers = centers.size(0)
+        label_indices = labels_mod
 
-    if neg_k <= 0:
-        return center_loss, 0.0
-
-    num_centers = centers.size(0)
     if num_centers <= 1:
+        neg_k = 0
+
+    neg_losses = []
+    if neg_k > 0 and num_centers > 1:
+        neg_k = min(neg_k, num_centers-1)
+        neg_indices = []
+        for label_idx in label_indices.tolist():
+            pool = torch.cat([
+                torch.arange(0, label_idx, device=hash_batch.device),
+                torch.arange(label_idx + 1, num_centers, device=hash_batch.device),
+            ])
+            if pool.numel() > neg_k:
+                perm = torch.randperm(pool.numel(), device=hash_batch.device)[:neg_k]
+                pool = pool[perm]
+            neg_indices.append(pool)
+        neg_indices = torch.stack(neg_indices, dim=0)
+        if center_mode == "random":
+            neg_centers = centers_unique[neg_indices]
+        else:
+            neg_centers = centers[neg_indices]
+
+        hash_exp = hash_batch.unsqueeze(1).expand(-1, neg_k, -1)
+        neg_loss = F.binary_cross_entropy(hash_exp, neg_centers, reduction="none").mean(dim=2)
+        neg_losses.append(neg_loss)
+
+    if ghost_centers is not None and ghost_centers.numel() > 0:
+        ghost_centers = ghost_centers.to(hash_batch.device)
+        ghost_exp = hash_batch.unsqueeze(1).expand(-1, ghost_centers.size(0), -1)
+        ghost_targets = ghost_centers.unsqueeze(0).expand(hash_batch.size(0), -1, -1)
+        ghost_loss = F.binary_cross_entropy(ghost_exp, ghost_targets, reduction="none").mean(dim=2)
+        neg_losses.append(ghost_loss)
+
+    if not neg_losses:
         return center_loss, 0.0
 
-    batch_size = hash_batch.size(0)
-    neg_k = min(neg_k, num_centers-1)
-    neg_indices = []
-    for label in labels[valid]:
-        label_idx = int(label.item())
-        pool = torch.cat([
-            torch.arange(0, label_idx, device=centers.device),
-            torch.arange(label_idx + 1, num_centers, device=centers.device),
-        ])
-        if pool.numel() > neg_k:
-            perm = torch.randperm(pool.numel(), device=centers.device)[:neg_k]
-            pool = pool[perm]
-        neg_indices.append(pool)
-    neg_indices = torch.stack(neg_indices, dim=0)
-    neg_centers = centers[neg_indices]
-
-    hash_exp = hash_batch.unsqueeze(1).expand(-1, neg_k, -1)
-    neg_loss = F.binary_cross_entropy(hash_exp, neg_centers, reduction="none").mean(dim=2)
+    neg_loss = torch.cat(neg_losses, dim=1)
     distinct_loss = -neg_loss.mean()
 
     return center_loss, distinct_loss
@@ -390,20 +444,14 @@ class EMA:
 # ============================================================================
 
 def train_step_trainable_two_view(
-    view1, view2, teacher, student, proj_head,
+    view1, view2, student,
     optimizer, scheduler, scaler, ema,
     args, device, effective_contrast_weight, update_step,
-    labels, centers,
+    labels, centers, ghost_centers,
 ):
     """Paper-exact training with TRAINABLE encoder and TWO views."""
     batch_size = view1.size(0)
     use_amp = args.amp and device.type == "cuda"
-
-    with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            teacher_out = teacher(view1)
-            teacher_emb = teacher_out.last_hidden_state[:, 0]
-            target = torch.sigmoid(proj_head(teacher_emb))
 
     y1 = student.y_init.expand(batch_size, -1).to(device)
     z1 = student.z_init.expand(batch_size, -1).to(device)
@@ -440,18 +488,19 @@ def train_step_trainable_two_view(
             hash1 = torch.sigmoid(student.output_head(y1_new))
             hash2 = torch.sigmoid(student.output_head(y2_new))
 
-            align_loss = 0.5 * (
-                F.binary_cross_entropy(hash1, target)
-                + F.binary_cross_entropy(hash2, target)
-            )
-
-            step_loss = align_loss
+            align_loss = torch.zeros((), device=device)
+            step_loss = torch.zeros((), device=device)
 
             if args.center_weight > 0 or args.distinct_weight > 0:
-                c1, d1 = hash_center_losses(hash1, labels, centers, args.center_neg_k)
-                c2, d2 = hash_center_losses(hash2, labels, centers, args.center_neg_k)
+                c1, d1 = hash_center_losses(
+                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
+                )
+                c2, d2 = hash_center_losses(
+                    hash2, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
+                )
                 center_loss = 0.5 * (c1 + c2)
                 distinct_loss = 0.5 * (d1 + d2)
+                align_loss = center_loss
                 if args.center_weight > 0:
                     step_loss = step_loss + args.center_weight * center_loss
                     center_loss_val = float(center_loss)
@@ -523,10 +572,10 @@ def train_step_trainable_two_view(
 
 
 def train_step_frozen_two_view(
-    view1, view2, teacher, student, proj_head,
+    view1, view2, student,
     optimizer, scheduler, scaler, ema,
     args, device, effective_contrast_weight, update_step,
-    labels, centers,
+    labels, centers, ghost_centers,
 ):
     """Paper-exact training with FROZEN encoder and TWO views."""
     batch_size = view1.size(0)
@@ -534,9 +583,6 @@ def train_step_frozen_two_view(
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=use_amp):
-            teacher_out = teacher(view1)
-            teacher_emb = teacher_out.last_hidden_state[:, 0]
-            target = torch.sigmoid(proj_head(teacher_emb))
             x1 = student.image_encoder(view1)
             x2 = student.image_encoder(view2)
 
@@ -572,18 +618,19 @@ def train_step_frozen_two_view(
             hash1 = torch.sigmoid(student.output_head(y1_new))
             hash2 = torch.sigmoid(student.output_head(y2_new))
 
-            align_loss = 0.5 * (
-                F.binary_cross_entropy(hash1, target)
-                + F.binary_cross_entropy(hash2, target)
-            )
-
-            step_loss = align_loss
+            align_loss = torch.zeros((), device=device)
+            step_loss = torch.zeros((), device=device)
 
             if args.center_weight > 0 or args.distinct_weight > 0:
-                c1, d1 = hash_center_losses(hash1, labels, centers, args.center_neg_k)
-                c2, d2 = hash_center_losses(hash2, labels, centers, args.center_neg_k)
+                c1, d1 = hash_center_losses(
+                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
+                )
+                c2, d2 = hash_center_losses(
+                    hash2, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
+                )
                 center_loss = 0.5 * (c1 + c2)
                 distinct_loss = 0.5 * (d1 + d2)
+                align_loss = center_loss
                 if args.center_weight > 0:
                     step_loss = step_loss + args.center_weight * center_loss
                     center_loss_val = float(center_loss)
@@ -655,10 +702,10 @@ def train_step_frozen_two_view(
 
 
 def train_step_single_view(
-    view1, teacher, student, proj_head,
+    view1, student,
     optimizer, scheduler, scaler, ema,
     args, device, update_step, freeze_encoder,
-    labels, centers,
+    labels, centers, ghost_centers,
 ):
     """Single-view training (no SimCLR)."""
     batch_size = view1.size(0)
@@ -666,9 +713,6 @@ def train_step_single_view(
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=use_amp):
-            teacher_out = teacher(view1)
-            teacher_emb = teacher_out.last_hidden_state[:, 0]
-            target = torch.sigmoid(proj_head(teacher_emb))
             if freeze_encoder:
                 x1 = student.image_encoder(view1)
 
@@ -702,13 +746,14 @@ def train_step_single_view(
             y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
             hash1 = torch.sigmoid(student.output_head(y1_new))
 
-            align_loss = F.binary_cross_entropy(hash1, target)
-            step_loss = align_loss
+            align_loss = torch.zeros((), device=device)
+            step_loss = torch.zeros((), device=device)
 
             if args.center_weight > 0 or args.distinct_weight > 0:
                 center_loss, distinct_loss = hash_center_losses(
-                    hash1, labels, centers, args.center_neg_k,
+                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
                 )
+                align_loss = center_loss
                 if args.center_weight > 0:
                     step_loss = step_loss + args.center_weight * center_loss
                     center_loss_val = float(center_loss)
@@ -848,13 +893,6 @@ def _create_dataloader(args, use_two_view):
 
 
 def _create_models(args, device):
-    print(f"Loading teacher: {args.teacher}")
-    teacher = AutoModel.from_pretrained(args.teacher, trust_remote_code=True).to(device)
-    teacher.eval()
-    for param in teacher.parameters():
-        param.requires_grad = False
-    teacher_dim = teacher.config.hidden_size
-
     print("Creating TRM student...")
     student = TRMHasher(
         embed_dim=args.embed_dim,
@@ -872,10 +910,6 @@ def _create_models(args, device):
     if args.channels_last:
         student = student.to(memory_format=torch.channels_last)
 
-    proj_head = nn.Linear(teacher_dim, args.hash_dim, bias=False).to(device)
-    nn.init.orthogonal_(proj_head.weight)
-    proj_head.requires_grad_(False)
-
     if args.resume:
         print(f"Resuming from: {args.resume}")
         safetensors.torch.load_model(student, args.resume)
@@ -884,7 +918,7 @@ def _create_models(args, device):
     total = sum(p.numel() for p in student.parameters())
     print(f"Student: {trainable:,} trainable / {total:,} total params")
 
-    return teacher, student, proj_head
+    return student
 
 
 def _create_optimizer_and_scheduler(args, student, steps_per_epoch):
@@ -911,7 +945,7 @@ def _create_optimizer_and_scheduler(args, student, steps_per_epoch):
     return optimizer, scheduler
 
 
-def save_checkpoint(model, proj_head, ema, save_dir, filename, args):
+def save_checkpoint(model, ema, save_dir, filename, args):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     save_path = Path(save_dir) / filename
     if ema is not None:
@@ -943,10 +977,10 @@ def save_checkpoint(model, proj_head, ema, save_dir, filename, args):
 # ============================================================================
 
 def _run_epoch(
-    epoch, loader, teacher, student, proj_head,
+    epoch, loader, student,
     optimizer, scheduler, scaler, ema,
     args, device, batch_step, update_step, use_two_view,
-    centers,
+    centers, ghost_centers,
 ):
     student.train()
     epoch_total_loss = 0.0
@@ -979,10 +1013,10 @@ def _run_epoch(
                 view2 = view2.contiguous(memory_format=torch.channels_last)
 
             losses = train_fn(
-                view1, view2, teacher, student, proj_head,
+                view1, view2, student,
                 optimizer, scheduler, scaler, ema,
                 args, device, effective_contrast_weight, update_step,
-                labels, centers,
+                labels, centers, ghost_centers,
             )
         else:
             labels = None
@@ -997,10 +1031,10 @@ def _run_epoch(
                 view1 = view1.contiguous(memory_format=torch.channels_last)
 
             losses = train_step_single_view(
-                view1, teacher, student, proj_head,
+                view1, student,
                 optimizer, scheduler, scaler, ema,
                 args, device, update_step, args.freeze_encoder,
-                labels, centers,
+                labels, centers, ghost_centers,
             )
 
         update_step = losses["update_step"]
@@ -1035,7 +1069,7 @@ def _run_epoch(
         if args.checkpoint_dir and args.checkpoint_every > 0:
             if update_step % args.checkpoint_every == 0:
                 save_checkpoint(
-                    student, proj_head, ema, args.checkpoint_dir,
+                    student, ema, args.checkpoint_dir,
                     f"student_u{update_step}.safetensors", args,
                 )
 
@@ -1054,13 +1088,34 @@ def train(args):
     set_seed(args.seed)
     _configure_backends(args, device)
 
-    use_two_view = args.contrast_weight > 0 or args.margin_weight > 0 or args.force_two_view
+    use_two_view = (
+        args.center_weight > 0
+        or args.distinct_weight > 0
+        or args.force_two_view
+    )
     mode_str = "two-view" if use_two_view else "single-view"
 
     loader, dataset = _create_dataloader(args, use_two_view)
     steps_per_epoch = len(loader)
 
-    teacher, student, proj_head = _create_models(args, device)
+    if args.center_weight <= 0 and args.distinct_weight <= 0:
+        raise ValueError("Center-only mode requires --center-weight > 0 or --distinct-weight > 0")
+
+    if args.label_mode != "none" and (args.center_weight > 0 or args.distinct_weight > 0):
+        if dataset.num_classes < 2:
+            raise ValueError(
+                "CRITICAL: fewer than 2 classes found. Center/Distinct losses cannot separate images. "
+                "Check your manifest, regex, or label_mode."
+            )
+
+    if args.contrast_weight > 0:
+        print("WARNING: contrast loss disabled in Strict LOGIC2.")
+        args.contrast_weight = 0.0
+    if args.margin_weight > 0:
+        print("WARNING: margin loss disabled in Strict LOGIC2.")
+        args.margin_weight = 0.0
+
+    student = _create_models(args, device)
     optimizer, scheduler = _create_optimizer_and_scheduler(args, student, steps_per_epoch)
 
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
@@ -1078,10 +1133,14 @@ def train(args):
     print(f"Updates/batch: {args.n_sup}, Total updates: ~{args.epochs * steps_per_epoch * args.n_sup:,}")
     print(
         "Losses: "
-        f"align(BCE) + C={args.center_weight} D={args.distinct_weight} "
-        f"Q={args.quant_weight} M={args.margin_weight} "
-        f"con={args.contrast_weight}"
+        f"center(C)={args.center_weight} distinct(D)={args.distinct_weight} "
+        f"quant(Q)={args.quant_weight} "
+        f"margin(M)={args.margin_weight} "
+        f"contrast(con)={args.contrast_weight}"
     )
+    print(f"Center mode: {args.center_mode}")
+    if args.center_mode == "random":
+        print(f"Extra negatives: {args.extra_negatives}")
     print(f"ACT: {args.use_act} (thr={args.act_threshold})")
     print(f"Hard negatives: k={args.hard_neg_k}")
     print("=" * 70 + "\n")
@@ -1091,34 +1150,54 @@ def train(args):
         if dataset.num_classes <= 0:
             print("WARNING: No labels available; hash-center losses will be disabled.")
         else:
-            max_centers = 2 * args.hash_dim
-            num_centers = args.num_centers if args.num_centers > 0 else dataset.num_classes
-            if num_centers > max_centers:
-                print(
-                    f"WARNING: num_centers={num_centers} exceeds Hadamard limit "
-                    f"({max_centers}); using {max_centers} with hash(label)%num_centers mapping."
-                )
-                num_centers = max_centers
-            try:
-                centers = build_hash_centers(
-                    num_centers=num_centers,
-                    hash_dim=args.hash_dim,
-                    device=device,
-                    seed=args.center_seed,
-                )
-                print(f"Hash centers: {num_centers} (classes={dataset.num_classes})")
-            except ValueError as exc:
-                print(f"WARNING: hash-center disabled: {exc}")
-                centers = None
+            if args.center_mode == "random":
+                print(f"Hash centers: random (classes={dataset.num_classes})")
+            else:
+                max_centers = 2 * args.hash_dim
+                num_centers = args.num_centers if args.num_centers > 0 else dataset.num_classes
+                if num_centers > max_centers:
+                    print(
+                        f"WARNING: num_centers={num_centers} exceeds Hadamard limit "
+                        f"({max_centers}); using {max_centers} with hash(label)%num_centers mapping."
+                    )
+                    num_centers = max_centers
+                try:
+                    centers = build_hash_centers(
+                        num_centers=num_centers,
+                        hash_dim=args.hash_dim,
+                        device=device,
+                        seed=args.center_seed,
+                    )
+                    print(f"Hash centers: {num_centers} (classes={dataset.num_classes})")
+                except ValueError as exc:
+                    print(f"WARNING: hash-center disabled: {exc}")
+                    centers = None
+    if centers is not None and args.margin_weight > 0:
+        print("WARNING: margin loss disabled when hash centers are active; use distinct loss instead.")
+        args.margin_weight = 0.0
+
+    ghost_centers = None
+    if args.distinct_weight > 0 and args.extra_negatives > 0:
+        if args.center_mode == "random":
+            ghost_seed = args.seed + 1337
+            ghost_centers = build_ghost_centers(
+                num_centers=args.extra_negatives,
+                hash_dim=args.hash_dim,
+                device=device,
+                seed=ghost_seed,
+            )
+            print(f"Ghost centers: {ghost_centers.size(0)}")
+        else:
+            print("WARNING: extra negatives ignored unless --center-mode=random")
 
     batch_step = 0
     update_step = 0
 
     for epoch in range(args.epochs):
         epoch_total, epoch_align, batch_step, update_step = _run_epoch(
-            epoch, loader, teacher, student, proj_head,
+            epoch, loader, student,
             optimizer, scheduler, scaler, ema,
-            args, device, batch_step, update_step, use_two_view, centers,
+            args, device, batch_step, update_step, use_two_view, centers, ghost_centers,
         )
 
         n_batches = len(loader)
@@ -1129,7 +1208,7 @@ def train(args):
 
         if args.checkpoint_dir:
             save_checkpoint(
-                student, proj_head, ema, args.checkpoint_dir,
+                student, ema, args.checkpoint_dir,
                 f"student_e{epoch+1}.safetensors", args,
             )
 
@@ -1138,7 +1217,7 @@ def train(args):
             break
 
     if args.checkpoint_dir:
-        save_checkpoint(student, proj_head, ema, args.checkpoint_dir, "student_final.safetensors", args)
+        save_checkpoint(student, ema, args.checkpoint_dir, "student_final.safetensors", args)
 
     print(f"\nTraining complete! Batches={batch_step}, Updates={update_step}")
 
@@ -1205,8 +1284,8 @@ def main():
     act_group.add_argument("--act-threshold", type=float, default=0.01)
 
     loss_group = parser.add_argument_group("Loss")
-    loss_group.add_argument("--contrast-weight", type=float, default=0.3,
-                            help="SimCLR weight (0=single-view mode)")
+    loss_group.add_argument("--contrast-weight", type=float, default=0.0,
+                            help="Deprecated in Strict LOGIC2 (always 0)")
     loss_group.add_argument("--nce-temperature", type=float, default=0.07)
     loss_group.add_argument("--contrast-warmup-epochs", type=int, default=1)
     loss_group.add_argument("--center-weight", type=float, default=1.0,
@@ -1215,8 +1294,8 @@ def main():
                             help="Distinct center loss weight (L_D)")
     loss_group.add_argument("--quant-weight", type=float, default=0.1,
                             help="Quantization loss weight (L_Q)")
-    loss_group.add_argument("--margin-weight", type=float, default=0.3,
-                            help="Hamming margin loss weight (L_M)")
+    loss_group.add_argument("--margin-weight", type=float, default=0.0,
+                            help="Deprecated in Strict LOGIC2 (always 0)")
     loss_group.add_argument("--hamming-delta", type=float, default=7.0,
                             help="Intra-class Hamming threshold (delta)")
     loss_group.add_argument("--hamming-mu", type=float, default=0.0,
@@ -1227,6 +1306,10 @@ def main():
                             help="Override number of hash centers (0=auto)")
     loss_group.add_argument("--center-seed", type=int, default=42,
                             help="Seed for Hadamard center permutation")
+    loss_group.add_argument("--center-mode", choices=["hadamard", "random"], default="hadamard",
+                            help="Center generation mode (hadamard or random)")
+    loss_group.add_argument("--extra-negatives", type=int, default=0,
+                            help="Extra random negatives for distinct loss (random center mode)")
     loss_group.add_argument("--hard-neg-k", type=int, default=0,
                             help="Top-k hard negatives for SimCLR (0=all)")
     loss_group.add_argument("--force-two-view", action="store_true",
