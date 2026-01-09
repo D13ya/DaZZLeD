@@ -58,4 +58,5 @@ keys/
 # Logs
 *.log
 
-ml-core/image/logic/1767896415379.png
+# Ignore user-generated figures and logic images
+ml-core/image/logic/
