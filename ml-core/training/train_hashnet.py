@@ -371,6 +371,13 @@ def build_backbone(name: str, hash_dim: int, pretrained: bool) -> nn.Module:
 
 def _get_base_transform(args):
     normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    if args.no_aug:
+        return transforms.Compose([
+            transforms.Resize(args.image_size + 32, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(args.image_size),
+            transforms.ToTensor(),
+            normalize,
+        ])
     return transforms.Compose([
         transforms.RandomResizedCrop(args.image_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -691,6 +698,7 @@ def main():
     train_group.add_argument("--center-mode", choices=["hadamard", "random"], default="random")
     train_group.add_argument("--extra-negatives", type=int, default=1024)
     train_group.add_argument("--single-view", action="store_true", help="Disable two-view augmentation")
+    train_group.add_argument("--no-aug", action="store_true", help="Disable data augmentation (resize+crop only)")
 
     infra_group = parser.add_argument_group("Infrastructure")
     infra_group.add_argument("--device", default="cuda")
