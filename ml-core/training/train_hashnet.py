@@ -63,7 +63,7 @@ def _denormalize_batch(batch: torch.Tensor, device: torch.device) -> torch.Tenso
 
 def quantization_loss(hash_batch: torch.Tensor) -> torch.Tensor:
     """Quantization loss (log cosh) to push hashes toward {0,1}."""
-    return torch.log(torch.cosh(torch.abs(2 * hash_batch - 1) - 1)).mean()
+    return (1 - torch.log(torch.cosh(torch.abs(2 * hash_batch - 1)))).mean()
 
 
 def simclr_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -210,7 +210,7 @@ def _distinct_center_loss(hash_logits, label_indices, centers_for_neg, neg_k: in
         return torch.zeros((), device=hash_logits.device)
 
     neg_loss = torch.cat(neg_losses, dim=1)
-    return -neg_loss.mean()
+    return neg_loss.mean()
 
 
 def hash_center_losses(hash_logits, labels, centers, neg_k: int, center_mode: str, ghost_centers: Optional[torch.Tensor]):
@@ -951,10 +951,15 @@ def train(args):
                     )
                     cf_logits, cf_proj = model(cf_view, return_proj=True)
                     cf_loss = simclr_loss(proj1, cf_proj, args.cf_temperature) if args.cf_weight > 0 else torch.zeros((), device=device)
-                    dhd = dhd_loss(torch.sigmoid(logits1), torch.sigmoid(cf_logits)) if args.dhd_weight > 0 else torch.zeros((), device=device)
+                    if args.dhd_weight > 0:
+                        h1 = 2 * torch.sigmoid(logits1) - 1
+                        h2 = 2 * torch.sigmoid(cf_logits) - 1
+                        dhd = dhd_loss(h1, h2)
+                    else:
+                        dhd = torch.zeros((), device=device)
 
                 base_hash = (
-                    args.center_weight * center_loss +
+                    args.center_weight * center_loss -
                     args.distinct_weight * distinct_loss +
                     args.quant_weight * q_loss
                 )
@@ -970,11 +975,11 @@ def train(args):
                     )
                     adv_q = quantization_loss(torch.sigmoid(adv_logits)) if args.quant_weight > 0 else torch.zeros((), device=device)
                     adv_hash = (
-                        args.center_weight * adv_center +
+                        args.center_weight * adv_center -
                         args.distinct_weight * adv_distinct +
                         args.quant_weight * adv_q
                     )
-                    adv_loss = 0.5 * (base_hash + adv_hash)
+                    adv_loss = adv_hash
 
                 total_loss = (
                     base_hash +
