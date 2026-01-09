@@ -979,18 +979,33 @@ def _create_optimizer_and_scheduler(args, student, steps_per_epoch):
         weight_decay=args.weight_decay,
     )
 
-    total_update_steps = args.epochs * steps_per_epoch * args.n_sup
+    total_update_steps = max(args.epochs * steps_per_epoch * args.n_sup, 1)
     warmup_batches = args.warmup_batches if args.warmup_batches > 0 else args.warmup_steps
-    warmup_updates = warmup_batches * args.n_sup
+    warmup_updates = min(warmup_batches * args.n_sup, max(total_update_steps - 1, 0))
 
     print(f"Scheduler: {total_update_steps:,} total updates, {warmup_updates:,} warmup")
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_update_steps,
-        pct_start=min(warmup_updates / total_update_steps, 0.1) if total_update_steps > 0 else 0.1,
-    )
+    if warmup_updates > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-3,
+            total_iters=warmup_updates,
+        )
+        cosine_steps = max(total_update_steps - warmup_updates, 1)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_steps,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_updates],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_update_steps,
+        )
 
     return optimizer, scheduler
 
