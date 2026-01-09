@@ -7,10 +7,17 @@ The ViT-L/16 variant provides high-quality dense features for semantic understan
 NOTE: Teacher output dim is 1024 for ViT-L, which gets projected to hash_dim
 via a frozen orthogonal projection in training.
 """
+import warnings
+
 from typing import Optional
 
 import torch
 from transformers import AutoModel, AutoImageProcessor
+
+warnings.warn(
+    "DEPRECATED: DINOv3 teacher is part of the legacy TRM pipeline. Use train_hashnet.py.",
+    RuntimeWarning,
+)
 
 
 # Available DINOv3 models (true IDs):

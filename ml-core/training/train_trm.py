@@ -15,6 +15,8 @@ Implementation notes:
 8. LOGIC2 losses: BCE alignment + hash centers + quantization + margin + SimCLR
 """
 
+import warnings
+
 import argparse
 from dataclasses import dataclass
 import hashlib
@@ -37,6 +39,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 from models.trm_hasher import TRMHasher
+
+warnings.warn(
+    "DEPRECATED: TRM training is superseded by train_hashnet.py (ResNet Hash Center pipeline).",
+    RuntimeWarning,
+)
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}

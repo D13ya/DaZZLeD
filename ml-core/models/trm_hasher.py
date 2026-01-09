@@ -15,9 +15,16 @@ Key design choices (paper-compliant):
 5. y update excludes x (key property for task differentiation)
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+warnings.warn(
+    "DEPRECATED: TRMHasher is superseded by the ResNet Hash Center model (train_hashnet.py).",
+    RuntimeWarning,
+)
 
 
 # ============================================================================
