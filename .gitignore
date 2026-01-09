@@ -23,6 +23,9 @@ api/proto/v1/*.pb.go
 .scannerwork/
 scannerwork/
 
+.literature/
+literature/
+
 # Git ignore file (note: if already tracked, you'll need to untrack it once)
 .gitignore
 
@@ -55,7 +58,4 @@ keys/
 # Logs
 *.log
 
-# Local PDFs (research papers)
-2024-1869.pdf
-Proof-Carrying Data without Succinct Arguments.pdf
-2020-1618.pdf
+ml-core/image/logic/1767896415379.png
