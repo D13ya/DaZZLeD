@@ -1073,7 +1073,7 @@ def main():
     )
     data_group.add_argument(
         "--domain-regex",
-        default=r"^(ffhq|openimages|openimg|mobileview)",
+        default=r"^(ffhq|openimages|openimg|mobileviews?)",
         help="Regex to extract domain from filename when --domain-mode=regex",
     )
     data_group.add_argument(

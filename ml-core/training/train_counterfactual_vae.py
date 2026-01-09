@@ -73,10 +73,21 @@ class DomainImageDataset(Dataset):
             removed = len(self.domain_ids) - len(keep)
             self.paths = [self.paths[i] for i in keep]
             self.raw_domains = [self.raw_domains[i] for i in keep]
-            self.domain_ids = [self.domain_ids[i] for i in keep]
-            print(f"Filtered {removed} unlabeled domain samples; {len(self.domain_ids)} remain.")
-            if not self.domain_ids:
+            print(f"Filtered {removed} unlabeled domain samples; {len(keep)} remain.")
+            if not keep:
                 raise ValueError("No labeled domains remain after filtering. Check --domain-regex.")
+            # Re-encode to ensure domain IDs are contiguous after filtering.
+            self.domain_map = {}
+            self.domain_ids = self._encode_domains(self.raw_domains)
+            self.num_domains = len(self.domain_map)
+        if self.domain_ids:
+            min_id = min(self.domain_ids)
+            max_id = max(self.domain_ids)
+            if min_id < 0 or max_id >= self.num_domains:
+                raise ValueError(
+                    f"Domain IDs out of range after encoding: min={min_id}, "
+                    f"max={max_id}, num_domains={self.num_domains}."
+                )
         self.images = [None] * len(self.paths)
         if self.cache_ram:
             self._cache_images()
@@ -305,7 +316,7 @@ def main():
     )
     data_group.add_argument(
         "--domain-regex",
-        default=r"^(ffhq|openimages|openimg|mobileview)",
+        default=r"^(ffhq|openimages|openimg|mobileviews?)",
         help="Regex to extract domain from filename",
     )
     data_group.add_argument(
