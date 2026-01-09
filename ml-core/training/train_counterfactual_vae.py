@@ -8,6 +8,7 @@ The model can then generate counterfactuals by swapping the domain embedding.
 import argparse
 import random
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -18,6 +19,9 @@ import safetensors.torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT))
 
 from models.counterfactual_vae import CounterfactualVAE
 
