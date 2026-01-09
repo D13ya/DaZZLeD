@@ -303,7 +303,7 @@ class FlatImageDataset(Dataset):
         if self.domain_mode == "none":
             return None
         if domain is None and self.domain_mode in ("regex", "auto") and self.domain_regex:
-            match = self.domain_regex.search(path.name)
+            match = self.domain_regex.search(str(path))
             if match:
                 try:
                     domain = match.group(self.domain_regex_group)
@@ -463,6 +463,20 @@ class ResNetHashNet(nn.Module):
             nn.Linear(proj_dim, proj_dim),
         )
         self.hash_head = nn.Linear(proj_dim, hash_dim)
+        self._init_heads()
+
+    def _init_heads(self) -> None:
+        for module in self.proj:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        nn.init.normal_(self.hash_head.weight, mean=0.0, std=0.01)
+        if self.hash_head.bias is not None:
+            nn.init.zeros_(self.hash_head.bias)
 
     def forward(self, x: torch.Tensor, return_proj: bool = False):
         x = self.encoder(x)
@@ -675,7 +689,7 @@ def _generate_counterfactual(
         target_domains = _sample_target_domains(domain_ids, cf_model.num_domains)
         raw_view = _denormalize_batch(view1, device).clamp(0, 1)
         with torch.no_grad():
-            cf_raw = cf_model(raw_view, target_domains)
+            cf_raw = cf_model.generate_counterfactual(raw_view, domain_ids, target_domains)
         cf_view = _normalize_batch(cf_raw, device)
         return cf_view
     raise ValueError(f"Unsupported counterfactual_mode: {args.counterfactual_mode}")
@@ -696,6 +710,10 @@ def _pgd_attack(
     eps = (args.pgd_epsilon / eps).clamp_min(1e-6)
     alpha = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
     alpha = (args.pgd_alpha / alpha).clamp_min(1e-6)
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    lower = (0.0 - mean) / std
+    upper = (1.0 - mean) / std
 
     x_adv = x.detach()
     x_orig = x.detach()
@@ -716,6 +734,7 @@ def _pgd_attack(
         grad = torch.autograd.grad(hash_loss, x_adv)[0]
         x_adv = x_adv + alpha * grad.sign()
         x_adv = torch.max(torch.min(x_adv, x_orig + eps), x_orig - eps)
+        x_adv = torch.max(torch.min(x_adv, upper), lower)
         x_adv = x_adv.detach()
     return x_adv
 

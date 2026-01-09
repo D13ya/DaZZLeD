@@ -71,7 +71,7 @@ class DomainImageDataset(Dataset):
         if self.domain_mode == "none":
             return None
         if domain is None and self.domain_mode in ("regex", "auto") and self.domain_regex:
-            match = self.domain_regex.search(path.name)
+            match = self.domain_regex.search(str(path))
             if match:
                 try:
                     domain = match.group(self.domain_regex_group)
@@ -208,6 +208,13 @@ def _save_checkpoint(model, checkpoint_dir: str, filename: str) -> None:
     print(f"Saved: {save_path}")
 
 
+def _vae_loss(recon, x, mu, logvar, decoder_var, kl_weight):
+    recon_loss = F.mse_loss(recon, x, reduction="sum") / (2.0 * decoder_var)
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    total = recon_loss + kl_weight * kld
+    return total, recon_loss, kld
+
+
 def train(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
@@ -235,16 +242,24 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=args.amp and device.type == "cuda"):
-                recon = model(images, domain_ids)
-                loss = F.l1_loss(recon, images)
+                recon, mu, logvar = model(images, domain_ids)
+                loss, recon_loss, kld = _vae_loss(
+                    recon, images, mu, logvar, args.decoder_var, args.kl_weight
+                )
 
+            loss = loss / images.size(0)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += loss.item()
             if batch_idx % args.log_interval == 0:
-                print(f"E{epoch+1} B{batch_idx} loss={loss.item():.4f}")
+                avg_recon = recon_loss.item() / images.size(0)
+                avg_kld = kld.item() / images.size(0)
+                print(
+                    f"E{epoch+1} B{batch_idx} loss={loss.item():.4f} "
+                    f"recon={avg_recon:.4f} kld={avg_kld:.4f}"
+                )
 
         avg = epoch_loss / len(loader)
         print(f"\n>>> Epoch {epoch+1}/{args.epochs} done. Avg loss={avg:.4f}\n")
@@ -292,6 +307,8 @@ def main():
     train_group.add_argument("--weight-decay", type=float, default=0.01)
     train_group.add_argument("--log-interval", type=int, default=50)
     train_group.add_argument("--checkpoint-dir", default="./checkpoints")
+    train_group.add_argument("--kl-weight", type=float, default=1.0)
+    train_group.add_argument("--decoder-var", type=float, default=1e-2)
 
     infra_group = parser.add_argument_group("Infrastructure")
     infra_group.add_argument("--device", default="cuda")
