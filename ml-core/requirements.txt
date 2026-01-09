@@ -1,26 +1,26 @@
-torch>=2.1.0,<3.0.0
-torchvision>=0.16.0,<1.0.0
-transformers>=4.56.0,<5.0.0
-Pillow>=10.0.0,<11.0.0
-safetensors>=0.4.0,<1.0.0
-onnx>=1.15.0,<2.0.0
-onnxruntime>=1.16.0,<2.0.0
+torch
+torchvision
+transformers
+Pillow
+safetensors
+onnx
+onnxruntime
 
 # Notebook dependencies (for test_model.ipynb)
 # NumPy 2.x aligns with Colab's preinstalled opencv/jax stack.
-numpy>=2.0.0,<2.3.0
-matplotlib>=3.7.0,<4.0.0
-scikit-learn>=1.5.0,<2.0.0
-scipy>=1.13.0,<2.0.0
-huggingface_hub>=0.36.0,<1.0.0
-tqdm>=4.65.0,<5.0.0
+numpy
+matplotlib
+scikit-learn
+scipy
+huggingface_hub
+tqdm
 
 # Colab filesystem compatibility (avoid fsspec/gcsfs resolver warnings)
-fsspec==2025.9.1
+fsspec
 
 # Dataset loading (for data download cells)
-datasets>=2.14.0,<3.0.0
-kaggle>=1.5.0,<2.0.0
+datasets
+kaggle
 
 # Optional: FiftyOne for advanced dataset visualization
-# fiftyone>=0.23.0,<1.0.0
+# fiftyone
