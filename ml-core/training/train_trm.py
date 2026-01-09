@@ -563,10 +563,10 @@ def _apply_center_distinct_losses_two_view(hash1_logits, hash2_logits, ctx: Trai
 
     if ctx.args.center_weight > 0:
         step_loss = step_loss + ctx.args.center_weight * center_loss
-        center_loss_val = float(center_loss)
+        center_loss_val = center_loss.item()
     if ctx.args.distinct_weight > 0:
         step_loss = step_loss + ctx.args.distinct_weight * distinct_loss
-        distinct_loss_val = float(distinct_loss)
+        distinct_loss_val = distinct_loss.item()
 
     return align_loss, step_loss, center_loss_val, distinct_loss_val
 
@@ -586,10 +586,10 @@ def _apply_center_distinct_losses_single_view(hash1_logits, ctx: TrainStepContex
     align_loss = center_loss
     if ctx.args.center_weight > 0:
         step_loss = step_loss + ctx.args.center_weight * center_loss
-        center_loss_val = float(center_loss)
+        center_loss_val = center_loss.item()
     if ctx.args.distinct_weight > 0:
         step_loss = step_loss + ctx.args.distinct_weight * distinct_loss
-        distinct_loss_val = float(distinct_loss)
+        distinct_loss_val = distinct_loss.item()
 
     return align_loss, step_loss, center_loss_val, distinct_loss_val
 
@@ -599,7 +599,7 @@ def _apply_quant_loss_two_view(step_loss, hash1, hash2, args):
         return step_loss, 0.0
     quant_loss = 0.5 * (quantization_loss(hash1) + quantization_loss(hash2))
     step_loss = step_loss + args.quant_weight * quant_loss
-    return step_loss, float(quant_loss)
+    return step_loss, quant_loss.item()
 
 
 def _apply_quant_loss_single_view(step_loss, hash1, args):
@@ -607,7 +607,7 @@ def _apply_quant_loss_single_view(step_loss, hash1, args):
         return step_loss, 0.0
     quant_loss = quantization_loss(hash1)
     step_loss = step_loss + args.quant_weight * quant_loss
-    return step_loss, float(quant_loss)
+    return step_loss, quant_loss.item()
 
 
 def _should_finalize_step(args, sup_step: int, align_loss):
@@ -637,7 +637,7 @@ def _apply_final_two_view_losses(step_loss, hash1, hash2, batch_size: int, ctx: 
             hash1, hash2, ctx.args.hamming_delta, ctx.args.hamming_mu,
         )
         step_loss = step_loss + ctx.args.margin_weight * margin_loss
-        margin_loss_val = float(margin_loss)
+        margin_loss_val = margin_loss.item()
 
     return step_loss, contrast_loss_val, margin_loss_val
 
@@ -1440,9 +1440,9 @@ def main():
                             help="Override number of hash centers (0=auto)")
     loss_group.add_argument("--center-seed", type=int, default=42,
                             help="Seed for Hadamard center permutation")
-    loss_group.add_argument("--center-mode", choices=["hadamard", "random"], default="hadamard",
+    loss_group.add_argument("--center-mode", choices=["hadamard", "random"], default="random",
                             help="Center generation mode (hadamard or random)")
-    loss_group.add_argument("--extra-negatives", type=int, default=0,
+    loss_group.add_argument("--extra-negatives", type=int, default=1024,
                             help="Extra random negatives for distinct loss (random center mode)")
     loss_group.add_argument("--hard-neg-k", type=int, default=0,
                             help="Top-k hard negatives for SimCLR (0=all)")
