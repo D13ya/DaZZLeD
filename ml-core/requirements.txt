@@ -12,11 +12,11 @@ numpy>=2.0.0,<2.3.0
 matplotlib>=3.7.0,<4.0.0
 scikit-learn>=1.5.0,<2.0.0
 scipy>=1.13.0,<2.0.0
-huggingface_hub>=0.20.0,<1.0.0
+huggingface_hub>=0.36.0,<1.0.0
 tqdm>=4.65.0,<5.0.0
 
 # Colab filesystem compatibility (avoid fsspec/gcsfs resolver warnings)
-fsspec==2025.3.0
+fsspec==2025.9.1
 
 # Dataset loading (for data download cells)
 datasets>=2.14.0,<3.0.0

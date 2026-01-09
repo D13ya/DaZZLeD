@@ -16,6 +16,7 @@ Implementation notes:
 """
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import random
 import re
@@ -166,6 +167,64 @@ def build_ghost_centers(num_centers: int, hash_dim: int, device: torch.device, s
     return (vec > 0.5).float().to(device)
 
 
+def _center_loss_and_indices(hash_batch, labels_valid, centers, center_mode):
+    if center_mode == "random":
+        unique_labels, inv = torch.unique(labels_valid, return_inverse=True, dim=0)
+        centers_unique = _random_centers_for_labels(unique_labels.cpu(), hash_batch.size(1), hash_batch.device)
+        centers_for_batch = centers_unique[inv]
+        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+        return center_loss, inv, centers_unique
+    if centers is None:
+        return None, None, None
+    labels_mod = labels_valid % centers.size(0)
+    centers_for_batch = centers[labels_mod]
+    center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
+    return center_loss, labels_mod, centers
+
+
+def _sample_negative_indices(label_indices, num_centers: int, neg_k: int, device):
+    neg_indices = []
+    for label_idx in label_indices.tolist():
+        pool = torch.cat([
+            torch.arange(0, label_idx, device=device),
+            torch.arange(label_idx + 1, num_centers, device=device),
+        ])
+        if pool.numel() > neg_k:
+            perm = torch.randperm(pool.numel(), device=device)[:neg_k]
+            pool = pool[perm]
+        neg_indices.append(pool)
+    return torch.stack(neg_indices, dim=0)
+
+
+def _distinct_center_loss(hash_batch, label_indices, centers_for_neg, neg_k: int, ghost_centers):
+    num_centers = centers_for_neg.size(0)
+    if num_centers <= 1:
+        neg_k = 0
+    else:
+        neg_k = min(neg_k, num_centers - 1)
+
+    neg_losses = []
+    if neg_k > 0:
+        neg_indices = _sample_negative_indices(label_indices, num_centers, neg_k, hash_batch.device)
+        neg_centers = centers_for_neg[neg_indices]
+        hash_exp = hash_batch.unsqueeze(1).expand(-1, neg_k, -1)
+        neg_loss = F.binary_cross_entropy(hash_exp, neg_centers, reduction="none").mean(dim=2)
+        neg_losses.append(neg_loss)
+
+    if ghost_centers is not None and ghost_centers.numel() > 0:
+        ghost_centers = ghost_centers.to(hash_batch.device)
+        ghost_exp = hash_batch.unsqueeze(1).expand(-1, ghost_centers.size(0), -1)
+        ghost_targets = ghost_centers.unsqueeze(0).expand(hash_batch.size(0), -1, -1)
+        ghost_loss = F.binary_cross_entropy(ghost_exp, ghost_targets, reduction="none").mean(dim=2)
+        neg_losses.append(ghost_loss)
+
+    if not neg_losses:
+        return 0.0
+
+    neg_loss = torch.cat(neg_losses, dim=1)
+    return -neg_loss.mean()
+
+
 def hash_center_losses(
     hash_batch,
     labels,
@@ -187,60 +246,15 @@ def hash_center_losses(
     hash_batch = hash_batch[valid]
     labels_valid = labels[valid]
 
-    if center_mode == "random":
-        unique_labels, inv = torch.unique(labels_valid, return_inverse=True)
-        centers_unique = _random_centers_for_labels(unique_labels.cpu(), hash_batch.size(1), hash_batch.device)
-        centers_for_batch = centers_unique[inv]
-        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
-        num_centers = centers_unique.size(0)
-        label_indices = inv
-    else:
-        if centers is None:
-            return 0.0, 0.0
-        labels_mod = labels_valid % centers.size(0)
-        centers_for_batch = centers[labels_mod]
-        center_loss = F.binary_cross_entropy(hash_batch, centers_for_batch, reduction="none").mean()
-        num_centers = centers.size(0)
-        label_indices = labels_mod
+    center_loss, label_indices, centers_for_neg = _center_loss_and_indices(
+        hash_batch, labels_valid, centers, center_mode,
+    )
+    if center_loss is None:
+        return 0.0, 0.0
 
-    if num_centers <= 1:
-        neg_k = 0
-
-    neg_losses = []
-    if neg_k > 0 and num_centers > 1:
-        neg_k = min(neg_k, num_centers-1)
-        neg_indices = []
-        for label_idx in label_indices.tolist():
-            pool = torch.cat([
-                torch.arange(0, label_idx, device=hash_batch.device),
-                torch.arange(label_idx + 1, num_centers, device=hash_batch.device),
-            ])
-            if pool.numel() > neg_k:
-                perm = torch.randperm(pool.numel(), device=hash_batch.device)[:neg_k]
-                pool = pool[perm]
-            neg_indices.append(pool)
-        neg_indices = torch.stack(neg_indices, dim=0)
-        if center_mode == "random":
-            neg_centers = centers_unique[neg_indices]
-        else:
-            neg_centers = centers[neg_indices]
-
-        hash_exp = hash_batch.unsqueeze(1).expand(-1, neg_k, -1)
-        neg_loss = F.binary_cross_entropy(hash_exp, neg_centers, reduction="none").mean(dim=2)
-        neg_losses.append(neg_loss)
-
-    if ghost_centers is not None and ghost_centers.numel() > 0:
-        ghost_centers = ghost_centers.to(hash_batch.device)
-        ghost_exp = hash_batch.unsqueeze(1).expand(-1, ghost_centers.size(0), -1)
-        ghost_targets = ghost_centers.unsqueeze(0).expand(hash_batch.size(0), -1, -1)
-        ghost_loss = F.binary_cross_entropy(ghost_exp, ghost_targets, reduction="none").mean(dim=2)
-        neg_losses.append(ghost_loss)
-
-    if not neg_losses:
-        return center_loss, 0.0
-
-    neg_loss = torch.cat(neg_losses, dim=1)
-    distinct_loss = -neg_loss.mean()
+    distinct_loss = _distinct_center_loss(
+        hash_batch, label_indices, centers_for_neg, neg_k, ghost_centers,
+    )
 
     return center_loss, distinct_loss
 
@@ -321,37 +335,46 @@ class FlatImageDataset(Dataset):
             label = path.parent.name
         return label
 
+    def _load_paths_from_list(self, list_file, label_mode):
+        paths = []
+        labels = []
+        base = Path(list_file).resolve().parent
+        raw_lines = [p.strip() for p in Path(list_file).read_text().splitlines() if p.strip()]
+        for line in raw_lines:
+            if line.startswith("#"):
+                continue
+            parts = line.split()
+            path = Path(parts[0])
+            if not path.is_absolute():
+                path = (base / path).resolve()
+            label = None
+            if label_mode in ("list", "auto") and len(parts) > 1:
+                label = parts[1]
+            label = self._extract_label(path, label_mode, label)
+            paths.append(path)
+            labels.append(label)
+        return paths, labels
+
+    def _load_paths_from_root(self, root, label_mode):
+        paths = []
+        labels = []
+        root_path = Path(root)
+        if not root_path.exists():
+            return paths, labels
+        for ext in IMAGE_EXTS:
+            for p in root_path.rglob(f"*{ext}"):
+                label = self._extract_label(p, label_mode, None)
+                paths.append(p)
+                labels.append(label)
+        return paths, labels
+
     def _load_paths(self, root, list_file, label_mode):
         paths = []
         labels = []
         if list_file:
-            base = Path(list_file).resolve().parent
-            raw_lines = [p.strip() for p in Path(list_file).read_text().splitlines() if p.strip()]
-            for line in raw_lines:
-                if line.startswith("#"):
-                    continue
-                parts = line.split()
-                p = parts[0]
-                path = Path(p)
-                if not path.is_absolute():
-                    path = (base / path).resolve()
-                label = None
-                if label_mode in ("list", "auto") and len(parts) > 1:
-                    label = parts[1]
-                label = self._extract_label(path, label_mode, label)
-                paths.append(path)
-                labels.append(label)
-
+            paths, labels = self._load_paths_from_list(list_file, label_mode)
         if not paths and root:
-            root_path = Path(root)
-            if root_path.exists():
-                for ext in IMAGE_EXTS:
-                    for p in root_path.rglob(f"*{ext}"):
-                        label = None
-                        label = self._extract_label(p, label_mode, label)
-                        paths.append(p)
-                        labels.append(label)
-
+            paths, labels = self._load_paths_from_root(root, label_mode)
         if not paths:
             raise ValueError("No images found. Provide --data or --data-list")
 
@@ -443,20 +466,185 @@ class EMA:
 # Training Steps
 # ============================================================================
 
-def train_step_trainable_two_view(
-    view1, view2, student,
-    optimizer, scheduler, scaler, ema,
-    args, device, effective_contrast_weight, update_step,
-    labels, centers, ghost_centers,
-):
-    """Paper-exact training with TRAINABLE encoder and TWO views."""
-    batch_size = view1.size(0)
-    use_amp = args.amp and device.type == "cuda"
+@dataclass
+class TrainRuntime:
+    optimizer: object
+    scheduler: object
+    scaler: object
+    ema: object | None
 
+
+@dataclass
+class TrainStepContext:
+    runtime: TrainRuntime
+    args: argparse.Namespace
+    device: torch.device
+    effective_contrast_weight: float
+    update_step: int
+    labels: torch.Tensor | None
+    centers: torch.Tensor | None
+    ghost_centers: torch.Tensor | None
+
+
+def _init_two_view_latents(student, batch_size: int, device: torch.device):
     y1 = student.y_init.expand(batch_size, -1).to(device)
     z1 = student.z_init.expand(batch_size, -1).to(device)
     y2 = student.y_init.expand(batch_size, -1).to(device)
     z2 = student.z_init.expand(batch_size, -1).to(device)
+    return y1, z1, y2, z2
+
+
+def _init_single_view_latents(student, batch_size: int, device: torch.device):
+    y1 = student.y_init.expand(batch_size, -1).to(device)
+    z1 = student.z_init.expand(batch_size, -1).to(device)
+    return y1, z1
+
+
+def _run_two_view_recursion(student, x1, x2, y1, z1, y2, z2, detach_input: bool):
+    y1_curr, z1_curr = y1, z1
+    y2_curr, z2_curr = y2, z2
+    x1_step = x1.detach() if detach_input else x1
+    x2_step = x2.detach() if detach_input else x2
+
+    with torch.no_grad():
+        for _ in range(student.t - 1):
+            y1_curr, z1_curr = student.latent_recursion(x1_step, y1_curr, z1_curr)
+            y2_curr, z2_curr = student.latent_recursion(x2_step, y2_curr, z2_curr)
+
+    y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
+    y2_new, z2_new = student.latent_recursion(x2, y2_curr, z2_curr)
+    hash1 = torch.sigmoid(student.output_head(y1_new))
+    hash2 = torch.sigmoid(student.output_head(y2_new))
+    return y1_new, z1_new, y2_new, z2_new, hash1, hash2
+
+
+def _run_single_view_recursion(student, x1, y1, z1, detach_input: bool):
+    y1_curr, z1_curr = y1, z1
+    x1_step = x1.detach() if detach_input else x1
+
+    with torch.no_grad():
+        for _ in range(student.t - 1):
+            y1_curr, z1_curr = student.latent_recursion(x1_step, y1_curr, z1_curr)
+
+    y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
+    hash1 = torch.sigmoid(student.output_head(y1_new))
+    return y1_new, z1_new, hash1
+
+
+def _apply_center_distinct_losses_two_view(hash1, hash2, ctx: TrainStepContext):
+    align_loss = torch.zeros((), device=ctx.device)
+    step_loss = torch.zeros((), device=ctx.device)
+    center_loss_val = 0.0
+    distinct_loss_val = 0.0
+
+    if ctx.args.center_weight <= 0 and ctx.args.distinct_weight <= 0:
+        return align_loss, step_loss, center_loss_val, distinct_loss_val
+
+    c1, d1 = hash_center_losses(
+        hash1, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+    )
+    c2, d2 = hash_center_losses(
+        hash2, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+    )
+    center_loss = 0.5 * (c1 + c2)
+    distinct_loss = 0.5 * (d1 + d2)
+    align_loss = center_loss
+
+    if ctx.args.center_weight > 0:
+        step_loss = step_loss + ctx.args.center_weight * center_loss
+        center_loss_val = float(center_loss)
+    if ctx.args.distinct_weight > 0:
+        step_loss = step_loss + ctx.args.distinct_weight * distinct_loss
+        distinct_loss_val = float(distinct_loss)
+
+    return align_loss, step_loss, center_loss_val, distinct_loss_val
+
+
+def _apply_center_distinct_losses_single_view(hash1, ctx: TrainStepContext):
+    align_loss = torch.zeros((), device=ctx.device)
+    step_loss = torch.zeros((), device=ctx.device)
+    center_loss_val = 0.0
+    distinct_loss_val = 0.0
+
+    if ctx.args.center_weight <= 0 and ctx.args.distinct_weight <= 0:
+        return align_loss, step_loss, center_loss_val, distinct_loss_val
+
+    center_loss, distinct_loss = hash_center_losses(
+        hash1, ctx.labels, ctx.centers, ctx.args.center_neg_k, ctx.args.center_mode, ctx.ghost_centers,
+    )
+    align_loss = center_loss
+    if ctx.args.center_weight > 0:
+        step_loss = step_loss + ctx.args.center_weight * center_loss
+        center_loss_val = float(center_loss)
+    if ctx.args.distinct_weight > 0:
+        step_loss = step_loss + ctx.args.distinct_weight * distinct_loss
+        distinct_loss_val = float(distinct_loss)
+
+    return align_loss, step_loss, center_loss_val, distinct_loss_val
+
+
+def _apply_quant_loss_two_view(step_loss, hash1, hash2, args):
+    if args.quant_weight <= 0:
+        return step_loss, 0.0
+    quant_loss = 0.5 * (quantization_loss(hash1) + quantization_loss(hash2))
+    step_loss = step_loss + args.quant_weight * quant_loss
+    return step_loss, float(quant_loss)
+
+
+def _apply_quant_loss_single_view(step_loss, hash1, args):
+    if args.quant_weight <= 0:
+        return step_loss, 0.0
+    quant_loss = quantization_loss(hash1)
+    step_loss = step_loss + args.quant_weight * quant_loss
+    return step_loss, float(quant_loss)
+
+
+def _should_finalize_step(args, sup_step: int, align_loss):
+    is_last_scheduled = (sup_step == args.n_sup - 1)
+    act_triggered = args.use_act and align_loss.item() < args.act_threshold
+    return is_last_scheduled or act_triggered, act_triggered
+
+
+def _apply_final_two_view_losses(step_loss, hash1, hash2, batch_size: int, ctx: TrainStepContext):
+    contrast_loss_val = 0.0
+    margin_loss_val = 0.0
+
+    if ctx.effective_contrast_weight > 0:
+        contrast_loss = simclr_loss(
+            hash1,
+            hash2,
+            temperature=ctx.args.nce_temperature,
+            hard_neg_k=ctx.args.hard_neg_k,
+        )
+        log_2b = torch.log(torch.tensor(2.0 * batch_size, device=ctx.device))
+        contrast_loss_normalized = contrast_loss / log_2b
+        step_loss = step_loss + ctx.effective_contrast_weight * contrast_loss_normalized
+        contrast_loss_val = contrast_loss_normalized.item()
+
+    if ctx.args.margin_weight > 0:
+        margin_loss = hamming_margin_loss(
+            hash1, hash2, ctx.args.hamming_delta, ctx.args.hamming_mu,
+        )
+        step_loss = step_loss + ctx.args.margin_weight * margin_loss
+        margin_loss_val = float(margin_loss)
+
+    return step_loss, contrast_loss_val, margin_loss_val
+
+
+def _apply_optimizer_step(step_loss, runtime: TrainRuntime, student):
+    runtime.scaler.scale(step_loss).backward()
+    runtime.scaler.step(runtime.optimizer)
+    runtime.scaler.update()
+    runtime.scheduler.step()
+    if runtime.ema is not None:
+        runtime.ema.update(student)
+
+
+def train_step_trainable_two_view(view1, view2, student, ctx: TrainStepContext):
+    """Paper-exact training with TRAINABLE encoder and TWO views."""
+    batch_size = view1.size(0)
+    use_amp = ctx.args.amp and ctx.device.type == "cuda"
+    y1, z1, y2, z2 = _init_two_view_latents(student, batch_size, ctx.device)
 
     align_losses = []
     total_losses = []
@@ -466,85 +654,32 @@ def train_step_trainable_two_view(
     quant_loss_val = 0.0
     margin_loss_val = 0.0
     final_step_executed = -1
+    update_step = ctx.update_step
 
-    for sup_step in range(args.n_sup):
-        optimizer.zero_grad(set_to_none=True)
+    for sup_step in range(ctx.args.n_sup):
+        ctx.runtime.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             x1 = student.image_encoder(view1)
             x2 = student.image_encoder(view2)
 
-            y1_curr, z1_curr = y1, z1
-            y2_curr, z2_curr = y2, z2
+            y1_new, z1_new, y2_new, z2_new, hash1, hash2 = _run_two_view_recursion(
+                student, x1, x2, y1, z1, y2, z2, detach_input=True,
+            )
 
-            with torch.no_grad():
-                for _ in range(student.t - 1):
-                    y1_curr, z1_curr = student.latent_recursion(x1.detach(), y1_curr, z1_curr)
-                    y2_curr, z2_curr = student.latent_recursion(x2.detach(), y2_curr, z2_curr)
+            align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_two_view(
+                hash1, hash2, ctx,
+            )
+            step_loss, quant_loss_val = _apply_quant_loss_two_view(step_loss, hash1, hash2, ctx.args)
 
-            y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
-            y2_new, z2_new = student.latent_recursion(x2, y2_curr, z2_curr)
-
-            hash1 = torch.sigmoid(student.output_head(y1_new))
-            hash2 = torch.sigmoid(student.output_head(y2_new))
-
-            align_loss = torch.zeros((), device=device)
-            step_loss = torch.zeros((), device=device)
-
-            if args.center_weight > 0 or args.distinct_weight > 0:
-                c1, d1 = hash_center_losses(
-                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
-                )
-                c2, d2 = hash_center_losses(
-                    hash2, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
-                )
-                center_loss = 0.5 * (c1 + c2)
-                distinct_loss = 0.5 * (d1 + d2)
-                align_loss = center_loss
-                if args.center_weight > 0:
-                    step_loss = step_loss + args.center_weight * center_loss
-                    center_loss_val = float(center_loss)
-                if args.distinct_weight > 0:
-                    step_loss = step_loss + args.distinct_weight * distinct_loss
-                    distinct_loss_val = float(distinct_loss)
-
-            if args.quant_weight > 0:
-                quant_loss = 0.5 * (quantization_loss(hash1) + quantization_loss(hash2))
-                step_loss = step_loss + args.quant_weight * quant_loss
-                quant_loss_val = float(quant_loss)
-
-            is_last_scheduled = (sup_step == args.n_sup - 1)
-            act_triggered = args.use_act and align_loss.item() < args.act_threshold
-            is_final = is_last_scheduled or act_triggered
-
+            is_final, act_triggered = _should_finalize_step(ctx.args, sup_step, align_loss)
             if is_final:
                 final_step_executed = sup_step
-                if effective_contrast_weight > 0:
-                    contrast_loss = simclr_loss(
-                        hash1,
-                        hash2,
-                        temperature=args.nce_temperature,
-                        hard_neg_k=args.hard_neg_k,
-                    )
-                    log_2b = torch.log(torch.tensor(2.0 * batch_size, device=device))
-                    contrast_loss_normalized = contrast_loss / log_2b
-                    step_loss = step_loss + effective_contrast_weight * contrast_loss_normalized
-                    contrast_loss_val = contrast_loss_normalized.item()
+                step_loss, contrast_loss_val, margin_loss_val = _apply_final_two_view_losses(
+                    step_loss, hash1, hash2, batch_size, ctx,
+                )
 
-                if args.margin_weight > 0:
-                    margin_loss = hamming_margin_loss(
-                        hash1, hash2, args.hamming_delta, args.hamming_mu,
-                    )
-                    step_loss = step_loss + args.margin_weight * margin_loss
-                    margin_loss_val = float(margin_loss)
-
-        scaler.scale(step_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        scheduler.step()
-        if ema is not None:
-            ema.update(student)
+        _apply_optimizer_step(step_loss, ctx.runtime, student)
 
         align_losses.append(align_loss.item())
         total_losses.append(step_loss.item())
@@ -571,25 +706,17 @@ def train_step_trainable_two_view(
     }
 
 
-def train_step_frozen_two_view(
-    view1, view2, student,
-    optimizer, scheduler, scaler, ema,
-    args, device, effective_contrast_weight, update_step,
-    labels, centers, ghost_centers,
-):
+def train_step_frozen_two_view(view1, view2, student, ctx: TrainStepContext):
     """Paper-exact training with FROZEN encoder and TWO views."""
     batch_size = view1.size(0)
-    use_amp = args.amp and device.type == "cuda"
+    use_amp = ctx.args.amp and ctx.device.type == "cuda"
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=use_amp):
             x1 = student.image_encoder(view1)
             x2 = student.image_encoder(view2)
 
-    y1 = student.y_init.expand(batch_size, -1).to(device)
-    z1 = student.z_init.expand(batch_size, -1).to(device)
-    y2 = student.y_init.expand(batch_size, -1).to(device)
-    z2 = student.z_init.expand(batch_size, -1).to(device)
+    y1, z1, y2, z2 = _init_two_view_latents(student, batch_size, ctx.device)
 
     align_losses = []
     total_losses = []
@@ -599,82 +726,29 @@ def train_step_frozen_two_view(
     quant_loss_val = 0.0
     margin_loss_val = 0.0
     final_step_executed = -1
+    update_step = ctx.update_step
 
-    for sup_step in range(args.n_sup):
-        optimizer.zero_grad(set_to_none=True)
+    for sup_step in range(ctx.args.n_sup):
+        ctx.runtime.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            y1_curr, z1_curr = y1, z1
-            y2_curr, z2_curr = y2, z2
+            y1_new, z1_new, y2_new, z2_new, hash1, hash2 = _run_two_view_recursion(
+                student, x1, x2, y1, z1, y2, z2, detach_input=False,
+            )
 
-            with torch.no_grad():
-                for _ in range(student.t - 1):
-                    y1_curr, z1_curr = student.latent_recursion(x1, y1_curr, z1_curr)
-                    y2_curr, z2_curr = student.latent_recursion(x2, y2_curr, z2_curr)
+            align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_two_view(
+                hash1, hash2, ctx,
+            )
+            step_loss, quant_loss_val = _apply_quant_loss_two_view(step_loss, hash1, hash2, ctx.args)
 
-            y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
-            y2_new, z2_new = student.latent_recursion(x2, y2_curr, z2_curr)
-
-            hash1 = torch.sigmoid(student.output_head(y1_new))
-            hash2 = torch.sigmoid(student.output_head(y2_new))
-
-            align_loss = torch.zeros((), device=device)
-            step_loss = torch.zeros((), device=device)
-
-            if args.center_weight > 0 or args.distinct_weight > 0:
-                c1, d1 = hash_center_losses(
-                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
-                )
-                c2, d2 = hash_center_losses(
-                    hash2, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
-                )
-                center_loss = 0.5 * (c1 + c2)
-                distinct_loss = 0.5 * (d1 + d2)
-                align_loss = center_loss
-                if args.center_weight > 0:
-                    step_loss = step_loss + args.center_weight * center_loss
-                    center_loss_val = float(center_loss)
-                if args.distinct_weight > 0:
-                    step_loss = step_loss + args.distinct_weight * distinct_loss
-                    distinct_loss_val = float(distinct_loss)
-
-            if args.quant_weight > 0:
-                quant_loss = 0.5 * (quantization_loss(hash1) + quantization_loss(hash2))
-                step_loss = step_loss + args.quant_weight * quant_loss
-                quant_loss_val = float(quant_loss)
-
-            is_last_scheduled = (sup_step == args.n_sup - 1)
-            act_triggered = args.use_act and align_loss.item() < args.act_threshold
-            is_final = is_last_scheduled or act_triggered
-
+            is_final, act_triggered = _should_finalize_step(ctx.args, sup_step, align_loss)
             if is_final:
                 final_step_executed = sup_step
-                if effective_contrast_weight > 0:
-                    contrast_loss = simclr_loss(
-                        hash1,
-                        hash2,
-                        temperature=args.nce_temperature,
-                        hard_neg_k=args.hard_neg_k,
-                    )
-                    log_2b = torch.log(torch.tensor(2.0 * batch_size, device=device))
-                    contrast_loss_normalized = contrast_loss / log_2b
-                    step_loss = step_loss + effective_contrast_weight * contrast_loss_normalized
-                    contrast_loss_val = contrast_loss_normalized.item()
+                step_loss, contrast_loss_val, margin_loss_val = _apply_final_two_view_losses(
+                    step_loss, hash1, hash2, batch_size, ctx,
+                )
 
-                if args.margin_weight > 0:
-                    margin_loss = hamming_margin_loss(
-                        hash1, hash2, args.hamming_delta, args.hamming_mu,
-                    )
-                    step_loss = step_loss + args.margin_weight * margin_loss
-                    margin_loss_val = float(margin_loss)
-
-        scaler.scale(step_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        scheduler.step()
-        if ema is not None:
-            ema.update(student)
+        _apply_optimizer_step(step_loss, ctx.runtime, student)
 
         align_losses.append(align_loss.item())
         total_losses.append(step_loss.item())
@@ -701,23 +775,19 @@ def train_step_frozen_two_view(
     }
 
 
-def train_step_single_view(
-    view1, student,
-    optimizer, scheduler, scaler, ema,
-    args, device, update_step, freeze_encoder,
-    labels, centers, ghost_centers,
-):
+def train_step_single_view(view1, student, ctx: TrainStepContext):
     """Single-view training (no SimCLR)."""
     batch_size = view1.size(0)
-    use_amp = args.amp and device.type == "cuda"
+    use_amp = ctx.args.amp and ctx.device.type == "cuda"
+    freeze_encoder = ctx.args.freeze_encoder
+    detach_input = not freeze_encoder
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=use_amp):
             if freeze_encoder:
                 x1 = student.image_encoder(view1)
 
-    y1 = student.y_init.expand(batch_size, -1).to(device)
-    z1 = student.z_init.expand(batch_size, -1).to(device)
+    y1, z1 = _init_single_view_latents(student, batch_size, ctx.device)
 
     align_losses = []
     total_losses = []
@@ -726,62 +796,31 @@ def train_step_single_view(
     quant_loss_val = 0.0
     margin_loss_val = 0.0
     final_step_executed = -1
+    update_step = ctx.update_step
 
-    for sup_step in range(args.n_sup):
-        optimizer.zero_grad(set_to_none=True)
+    for sup_step in range(ctx.args.n_sup):
+        ctx.runtime.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             if not freeze_encoder:
                 x1 = student.image_encoder(view1)
 
-            y1_curr, z1_curr = y1, z1
+            y1_new, z1_new, hash1 = _run_single_view_recursion(
+                student, x1, y1, z1, detach_input,
+            )
 
-            with torch.no_grad():
-                for _ in range(student.t - 1):
-                    if freeze_encoder:
-                        y1_curr, z1_curr = student.latent_recursion(x1, y1_curr, z1_curr)
-                    else:
-                        y1_curr, z1_curr = student.latent_recursion(x1.detach(), y1_curr, z1_curr)
+            align_loss, step_loss, center_loss_val, distinct_loss_val = _apply_center_distinct_losses_single_view(
+                hash1, ctx,
+            )
+            step_loss, quant_loss_val = _apply_quant_loss_single_view(step_loss, hash1, ctx.args)
 
-            y1_new, z1_new = student.latent_recursion(x1, y1_curr, z1_curr)
-            hash1 = torch.sigmoid(student.output_head(y1_new))
-
-            align_loss = torch.zeros((), device=device)
-            step_loss = torch.zeros((), device=device)
-
-            if args.center_weight > 0 or args.distinct_weight > 0:
-                center_loss, distinct_loss = hash_center_losses(
-                    hash1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
-                )
-                align_loss = center_loss
-                if args.center_weight > 0:
-                    step_loss = step_loss + args.center_weight * center_loss
-                    center_loss_val = float(center_loss)
-                if args.distinct_weight > 0:
-                    step_loss = step_loss + args.distinct_weight * distinct_loss
-                    distinct_loss_val = float(distinct_loss)
-
-            if args.quant_weight > 0:
-                quant_loss = quantization_loss(hash1)
-                step_loss = step_loss + args.quant_weight * quant_loss
-                quant_loss_val = float(quant_loss)
-
-            is_last_scheduled = (sup_step == args.n_sup - 1)
-            act_triggered = args.use_act and align_loss.item() < args.act_threshold
-            is_final = is_last_scheduled or act_triggered
-
+            is_final, act_triggered = _should_finalize_step(ctx.args, sup_step, align_loss)
             if is_final:
                 final_step_executed = sup_step
-                if args.margin_weight > 0:
+                if ctx.args.margin_weight > 0:
                     margin_loss_val = 0.0
 
-        scaler.scale(step_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        scheduler.step()
-        if ema is not None:
-            ema.update(student)
+        _apply_optimizer_step(step_loss, ctx.runtime, student)
 
         align_losses.append(align_loss.item())
         total_losses.append(step_loss.item())
@@ -976,9 +1015,92 @@ def save_checkpoint(model, ema, save_dir, filename, args):
 # Epoch Runner
 # ============================================================================
 
+def _effective_contrast_weight(args, epoch: int) -> float:
+    return args.contrast_weight if epoch >= args.contrast_warmup_epochs else 0.0
+
+
+def _select_two_view_train_fn(args):
+    return train_step_frozen_two_view if args.freeze_encoder else train_step_trainable_two_view
+
+
+def _prepare_two_view_batch(batch, device: torch.device, channels_last: bool):
+    labels = None
+    if isinstance(batch, (tuple, list)) and len(batch) == 2 and torch.is_tensor(batch[1]):
+        views, labels = batch
+    else:
+        views = batch
+    view1, view2 = views
+    view1 = view1.to(device, non_blocking=True)
+    view2 = view2.to(device, non_blocking=True)
+    if labels is not None:
+        labels = labels.to(device, non_blocking=True)
+    if channels_last:
+        view1 = view1.contiguous(memory_format=torch.channels_last)
+        view2 = view2.contiguous(memory_format=torch.channels_last)
+    return view1, view2, labels
+
+
+def _prepare_single_view_batch(batch, device: torch.device, channels_last: bool):
+    labels = None
+    if isinstance(batch, (tuple, list)) and len(batch) == 2 and torch.is_tensor(batch[1]):
+        view1, labels = batch
+    else:
+        view1 = batch
+    view1 = view1.to(device, non_blocking=True)
+    if labels is not None:
+        labels = labels.to(device, non_blocking=True)
+    if channels_last:
+        view1 = view1.contiguous(memory_format=torch.channels_last)
+    return view1, labels
+
+
+def _maybe_check_collision(args, student, view1, batch_step: int, last_collision):
+    if args.collision_interval <= 0 or batch_step % args.collision_interval != 0:
+        return last_collision
+    with torch.no_grad():
+        hashes = student.inference(view1, n_sup=args.n_sup)
+        collisions = count_hash_collisions(hashes, threshold=args.collision_threshold)
+        entropy = hash_entropy_estimate(hashes).item()
+    return (collisions, entropy)
+
+
+def _maybe_log_batch(args, optimizer, epoch: int, batch_idx: int, batch_step: int,
+                     update_step: int, losses, last_collision):
+    if batch_step % args.log_interval != 0:
+        return last_collision
+    lr = optimizer.param_groups[0]["lr"]
+    line = (
+        f"E{epoch+1} B{batch_idx} U{update_step} "
+        f"tot={losses['total']:.4f} ali={losses['align']:.4f} "
+        f"ctr={losses['center']:.4f} dst={losses['distinct']:.4f} "
+        f"q={losses['quant']:.4f} m={losses['margin']:.4f} "
+        f"con={losses['contrast']:.4f} "
+        f"sup={losses['n_steps']} lr={lr:.2e}"
+    )
+    if last_collision is not None:
+        line += f" col={last_collision[0]} ent={last_collision[1]:.1f}"
+        last_collision = None
+    print(line)
+    return last_collision
+
+
+def _maybe_save_update_checkpoint(args, student, ema, update_step: int):
+    if not args.checkpoint_dir or args.checkpoint_every <= 0:
+        return
+    if update_step % args.checkpoint_every == 0:
+        save_checkpoint(
+            student, ema, args.checkpoint_dir,
+            f"student_u{update_step}.safetensors", args,
+        )
+
+
+def _should_stop_updates(args, update_step: int) -> bool:
+    return bool(args.max_updates) and update_step >= args.max_updates
+
+
 def _run_epoch(
     epoch, loader, student,
-    optimizer, scheduler, scaler, ema,
+    runtime: TrainRuntime,
     args, device, batch_step, update_step, use_two_view,
     centers, ghost_centers,
 ):
@@ -987,55 +1109,36 @@ def _run_epoch(
     epoch_align_loss = 0.0
     last_collision = None
 
-    effective_contrast_weight = (
-        args.contrast_weight if epoch >= args.contrast_warmup_epochs else 0.0
-    )
-
-    if use_two_view:
-        train_fn = train_step_frozen_two_view if args.freeze_encoder else train_step_trainable_two_view
-    else:
-        train_fn = None
+    effective_contrast_weight = _effective_contrast_weight(args, epoch)
+    train_fn = _select_two_view_train_fn(args) if use_two_view else None
 
     for batch_idx, batch in enumerate(loader, start=1):
         if use_two_view:
-            labels = None
-            if isinstance(batch, (tuple, list)) and len(batch) == 2 and torch.is_tensor(batch[1]):
-                views, labels = batch
-            else:
-                views = batch
-            view1, view2 = views
-            view1 = view1.to(device, non_blocking=True)
-            view2 = view2.to(device, non_blocking=True)
-            if labels is not None:
-                labels = labels.to(device, non_blocking=True)
-            if args.channels_last:
-                view1 = view1.contiguous(memory_format=torch.channels_last)
-                view2 = view2.contiguous(memory_format=torch.channels_last)
-
-            losses = train_fn(
-                view1, view2, student,
-                optimizer, scheduler, scaler, ema,
-                args, device, effective_contrast_weight, update_step,
-                labels, centers, ghost_centers,
+            view1, view2, labels = _prepare_two_view_batch(batch, device, args.channels_last)
+            ctx = TrainStepContext(
+                runtime=runtime,
+                args=args,
+                device=device,
+                effective_contrast_weight=effective_contrast_weight,
+                update_step=update_step,
+                labels=labels,
+                centers=centers,
+                ghost_centers=ghost_centers,
             )
+            losses = train_fn(view1, view2, student, ctx)
         else:
-            labels = None
-            if isinstance(batch, (tuple, list)) and len(batch) == 2 and torch.is_tensor(batch[1]):
-                view1, labels = batch
-            else:
-                view1 = batch
-            view1 = view1.to(device, non_blocking=True)
-            if labels is not None:
-                labels = labels.to(device, non_blocking=True)
-            if args.channels_last:
-                view1 = view1.contiguous(memory_format=torch.channels_last)
-
-            losses = train_step_single_view(
-                view1, student,
-                optimizer, scheduler, scaler, ema,
-                args, device, update_step, args.freeze_encoder,
-                labels, centers, ghost_centers,
+            view1, labels = _prepare_single_view_batch(batch, device, args.channels_last)
+            ctx = TrainStepContext(
+                runtime=runtime,
+                args=args,
+                device=device,
+                effective_contrast_weight=0.0,
+                update_step=update_step,
+                labels=labels,
+                centers=centers,
+                ghost_centers=ghost_centers,
             )
+            losses = train_step_single_view(view1, student, ctx)
 
         update_step = losses["update_step"]
         batch_step += 1
@@ -1043,37 +1146,12 @@ def _run_epoch(
         epoch_total_loss += losses["total"]
         epoch_align_loss += losses["align"]
 
-        if args.collision_interval > 0 and batch_step % args.collision_interval == 0:
-            with torch.no_grad():
-                test_view = view1
-                hashes = student.inference(test_view, n_sup=args.n_sup)
-                collisions = count_hash_collisions(hashes, threshold=args.collision_threshold)
-                entropy = hash_entropy_estimate(hashes).item()
-                last_collision = (collisions, entropy)
-
-        if batch_step % args.log_interval == 0:
-            lr = optimizer.param_groups[0]["lr"]
-            line = (
-                f"E{epoch+1} B{batch_idx} U{update_step} "
-                f"tot={losses['total']:.4f} ali={losses['align']:.4f} "
-                f"ctr={losses['center']:.4f} dst={losses['distinct']:.4f} "
-                f"q={losses['quant']:.4f} m={losses['margin']:.4f} "
-                f"con={losses['contrast']:.4f} "
-                f"sup={losses['n_steps']} lr={lr:.2e}"
-            )
-            if last_collision is not None:
-                line += f" col={last_collision[0]} ent={last_collision[1]:.1f}"
-                last_collision = None
-            print(line)
-
-        if args.checkpoint_dir and args.checkpoint_every > 0:
-            if update_step % args.checkpoint_every == 0:
-                save_checkpoint(
-                    student, ema, args.checkpoint_dir,
-                    f"student_u{update_step}.safetensors", args,
-                )
-
-        if args.max_updates and update_step >= args.max_updates:
+        last_collision = _maybe_check_collision(args, student, view1, batch_step, last_collision)
+        last_collision = _maybe_log_batch(
+            args, runtime.optimizer, epoch, batch_idx, batch_step, update_step, losses, last_collision,
+        )
+        _maybe_save_update_checkpoint(args, student, runtime.ema, update_step)
+        if _should_stop_updates(args, update_step):
             break
 
     return epoch_total_loss, epoch_align_loss, batch_step, update_step
@@ -1083,24 +1161,19 @@ def _run_epoch(
 # Main
 # ============================================================================
 
-def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    set_seed(args.seed)
-    _configure_backends(args, device)
-
+def _resolve_mode(args):
     use_two_view = (
         args.center_weight > 0
         or args.distinct_weight > 0
         or args.force_two_view
     )
     mode_str = "two-view" if use_two_view else "single-view"
+    return use_two_view, mode_str
 
-    loader, dataset = _create_dataloader(args, use_two_view)
-    steps_per_epoch = len(loader)
 
+def _validate_label_requirements(args, dataset):
     if args.center_weight <= 0 and args.distinct_weight <= 0:
         raise ValueError("Center-only mode requires --center-weight > 0 or --distinct-weight > 0")
-
     if args.label_mode != "none" and (args.center_weight > 0 or args.distinct_weight > 0):
         if dataset.num_classes < 2:
             raise ValueError(
@@ -1108,6 +1181,8 @@ def train(args):
                 "Check your manifest, regex, or label_mode."
             )
 
+
+def _apply_strict_logic2(args):
     if args.contrast_weight > 0:
         print("WARNING: contrast loss disabled in Strict LOGIC2.")
         args.contrast_weight = 0.0
@@ -1115,12 +1190,8 @@ def train(args):
         print("WARNING: margin loss disabled in Strict LOGIC2.")
         args.margin_weight = 0.0
 
-    student = _create_models(args, device)
-    optimizer, scheduler = _create_optimizer_and_scheduler(args, student, steps_per_epoch)
 
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
-    ema = EMA(student, decay=args.ema_decay) if args.use_ema else None
-
+def _print_training_header(args, mode_str: str, steps_per_epoch: int):
     print("\n" + "=" * 70)
     print("TRM Training - Paper-Exact")
     print("=" * 70)
@@ -1145,81 +1216,133 @@ def train(args):
     print(f"Hard negatives: k={args.hard_neg_k}")
     print("=" * 70 + "\n")
 
-    centers = None
-    if args.center_weight > 0 or args.distinct_weight > 0:
-        if dataset.num_classes <= 0:
-            print("WARNING: No labels available; hash-center losses will be disabled.")
-        else:
-            if args.center_mode == "random":
-                print(f"Hash centers: random (classes={dataset.num_classes})")
-            else:
-                max_centers = 2 * args.hash_dim
-                num_centers = args.num_centers if args.num_centers > 0 else dataset.num_classes
-                if num_centers > max_centers:
-                    print(
-                        f"WARNING: num_centers={num_centers} exceeds Hadamard limit "
-                        f"({max_centers}); using {max_centers} with hash(label)%num_centers mapping."
-                    )
-                    num_centers = max_centers
-                try:
-                    centers = build_hash_centers(
-                        num_centers=num_centers,
-                        hash_dim=args.hash_dim,
-                        device=device,
-                        seed=args.center_seed,
-                    )
-                    print(f"Hash centers: {num_centers} (classes={dataset.num_classes})")
-                except ValueError as exc:
-                    print(f"WARNING: hash-center disabled: {exc}")
-                    centers = None
+
+def _build_centers(args, dataset, device: torch.device):
+    if args.center_weight <= 0 and args.distinct_weight <= 0:
+        return None
+    if dataset.num_classes <= 0:
+        print("WARNING: No labels available; hash-center losses will be disabled.")
+        return None
+    if args.center_mode == "random":
+        print(f"Hash centers: random (classes={dataset.num_classes})")
+        return None
+
+    max_centers = 2 * args.hash_dim
+    num_centers = args.num_centers if args.num_centers > 0 else dataset.num_classes
+    if num_centers > max_centers:
+        print(
+            f"WARNING: num_centers={num_centers} exceeds Hadamard limit "
+            f"({max_centers}); using {max_centers} with hash(label)%num_centers mapping."
+        )
+        num_centers = max_centers
+    try:
+        centers = build_hash_centers(
+            num_centers=num_centers,
+            hash_dim=args.hash_dim,
+            device=device,
+            seed=args.center_seed,
+        )
+        print(f"Hash centers: {num_centers} (classes={dataset.num_classes})")
+        return centers
+    except ValueError as exc:
+        print(f"WARNING: hash-center disabled: {exc}")
+        return None
+
+
+def _maybe_disable_margin_with_centers(args, centers):
     if centers is not None and args.margin_weight > 0:
         print("WARNING: margin loss disabled when hash centers are active; use distinct loss instead.")
         args.margin_weight = 0.0
 
-    ghost_centers = None
-    if args.distinct_weight > 0 and args.extra_negatives > 0:
-        if args.center_mode == "random":
-            ghost_seed = args.seed + 1337
-            ghost_centers = build_ghost_centers(
-                num_centers=args.extra_negatives,
-                hash_dim=args.hash_dim,
-                device=device,
-                seed=ghost_seed,
-            )
-            print(f"Ghost centers: {ghost_centers.size(0)}")
-        else:
-            print("WARNING: extra negatives ignored unless --center-mode=random")
 
+def _build_ghost_centers(args, device: torch.device):
+    if args.distinct_weight <= 0 or args.extra_negatives <= 0:
+        return None
+    if args.center_mode != "random":
+        print("WARNING: extra negatives ignored unless --center-mode=random")
+        return None
+    ghost_seed = args.seed + 1337
+    ghost_centers = build_ghost_centers(
+        num_centers=args.extra_negatives,
+        hash_dim=args.hash_dim,
+        device=device,
+        seed=ghost_seed,
+    )
+    print(f"Ghost centers: {ghost_centers.size(0)}")
+    return ghost_centers
+
+
+def _log_epoch_summary(epoch: int, args, epoch_total: float, epoch_align: float, n_batches: int):
+    print(
+        f"\n>>> Epoch {epoch+1}/{args.epochs} done. "
+        f"Avg total={epoch_total/n_batches:.4f} align={epoch_align/n_batches:.4f}\n"
+    )
+
+
+def _maybe_save_epoch_checkpoint(args, student, ema, epoch: int):
+    if args.checkpoint_dir:
+        save_checkpoint(
+            student, ema, args.checkpoint_dir,
+            f"student_e{epoch+1}.safetensors", args,
+        )
+
+
+def _run_training_loop(args, loader, student, runtime: TrainRuntime, device: torch.device,
+                       use_two_view: bool, centers, ghost_centers):
     batch_step = 0
     update_step = 0
-
     for epoch in range(args.epochs):
         epoch_total, epoch_align, batch_step, update_step = _run_epoch(
             epoch, loader, student,
-            optimizer, scheduler, scaler, ema,
+            runtime,
             args, device, batch_step, update_step, use_two_view, centers, ghost_centers,
         )
 
-        n_batches = len(loader)
-        print(
-            f"\n>>> Epoch {epoch+1}/{args.epochs} done. "
-            f"Avg total={epoch_total/n_batches:.4f} align={epoch_align/n_batches:.4f}\n"
-        )
+        _log_epoch_summary(epoch, args, epoch_total, epoch_align, len(loader))
+        _maybe_save_epoch_checkpoint(args, student, runtime.ema, epoch)
 
-        if args.checkpoint_dir:
-            save_checkpoint(
-                student, ema, args.checkpoint_dir,
-                f"student_e{epoch+1}.safetensors", args,
-            )
-
-        if args.max_updates and update_step >= args.max_updates:
+        if _should_stop_updates(args, update_step):
             print(f"Reached max_updates={args.max_updates}, stopping.")
             break
 
     if args.checkpoint_dir:
-        save_checkpoint(student, ema, args.checkpoint_dir, "student_final.safetensors", args)
+        save_checkpoint(student, runtime.ema, args.checkpoint_dir, "student_final.safetensors", args)
 
     print(f"\nTraining complete! Batches={batch_step}, Updates={update_step}")
+
+
+def train(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    set_seed(args.seed)
+    _configure_backends(args, device)
+
+    use_two_view, mode_str = _resolve_mode(args)
+
+    loader, dataset = _create_dataloader(args, use_two_view)
+    steps_per_epoch = len(loader)
+
+    _validate_label_requirements(args, dataset)
+    _apply_strict_logic2(args)
+
+    student = _create_models(args, device)
+    optimizer, scheduler = _create_optimizer_and_scheduler(args, student, steps_per_epoch)
+
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    ema = EMA(student, decay=args.ema_decay) if args.use_ema else None
+
+    _print_training_header(args, mode_str, steps_per_epoch)
+
+    centers = _build_centers(args, dataset, device)
+    _maybe_disable_margin_with_centers(args, centers)
+    ghost_centers = _build_ghost_centers(args, device)
+
+    runtime = TrainRuntime(
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        ema=ema,
+    )
+    _run_training_loop(args, loader, student, runtime, device, use_two_view, centers, ghost_centers)
 
 
 # ============================================================================
