@@ -286,6 +286,7 @@ def main():
     data_group.add_argument("--max-images", type=int, default=0, help="Limit images (0=all)")
     data_group.add_argument("--cache-ram", action="store_true", help="Cache images in RAM")
     data_group.add_argument("--workers", type=int, default=8, help="DataLoader workers")
+    data_group.add_argument("--image-size", type=int, default=224, help="Input image size")
     data_group.add_argument(
         "--domain-mode",
         choices=["none", "regex", "parent", "auto"],
