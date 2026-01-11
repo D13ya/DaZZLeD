@@ -6,6 +6,7 @@ The model can then generate counterfactuals by swapping the domain embedding.
 """
 
 import argparse
+import io
 import random
 import re
 import sys
@@ -178,12 +179,39 @@ class DomainImageDataset(Dataset):
         return self.transform(img), self.domain_ids[idx]
 
 
+class RandomJPEGCompression:
+    def __init__(self, quality_range=(50, 95), p=0.3):
+        self.quality_range = quality_range
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        quality = random.randint(self.quality_range[0], self.quality_range[1])
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality)
+        buffer.seek(0)
+        out = Image.open(buffer).convert("RGB")
+        out.load()
+        buffer.close()
+        return out
+
+
 def _create_dataloader(args):
-    transform = transforms.Compose([
+    base = [
         transforms.Resize(args.image_size + 32, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(args.image_size),
+        transforms.RandomCrop(args.image_size),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(0.4, 0.4, 0.4, 0.0),
+        RandomJPEGCompression(p=0.3, quality_range=(50, 95)),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
+            p=0.3,
+        ),
         transforms.ToTensor(),
-    ])
+    ]
+
+    transform = transforms.Compose(base)
 
     dataset = DomainImageDataset(
         root=args.data if args.data else None,

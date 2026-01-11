@@ -417,6 +417,24 @@ class SingleViewTransform:
         return self.transform(img)
 
 
+class RandomJPEGCompression:
+    def __init__(self, quality_range=(50, 95), p=0.3):
+        self.quality_range = quality_range
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        quality = random.randint(self.quality_range[0], self.quality_range[1])
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality)
+        buffer.seek(0)
+        out = Image.open(buffer).convert("RGB")
+        out.load()
+        buffer.close()
+        return out
+
+
 class TwoViewTransform:
     def __init__(self, base_transform):
         self.transform = base_transform
@@ -501,11 +519,15 @@ def _get_base_transform(args):
             transforms.ToTensor(),
             normalize,
         ])
+    jpeg = RandomJPEGCompression(p=0.3, quality_range=(50, 95))
+    blur = transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
     return transforms.Compose([
         transforms.Resize(args.image_size + 32, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomCrop(args.image_size),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(0.4, 0.4, 0.4, 0.0),
+        jpeg,
+        transforms.RandomApply([blur], p=0.3),
         transforms.ToTensor(),
         normalize,
     ])
@@ -992,9 +1014,14 @@ def train(args):
             if args.clip_grad > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            prev_step = getattr(optimizer, "_step_count", None)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if prev_step is None:
+                scheduler.step()
+            elif getattr(optimizer, "_step_count", 0) > prev_step:
+                # Only advance the scheduler if the optimizer actually stepped.
+                scheduler.step()
 
             update_step += 1
             epoch_total += total_loss.item()
