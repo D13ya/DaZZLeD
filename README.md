@@ -30,29 +30,29 @@ DaZZLeD is a **privacy-preserving content detection system** that generates perc
 ```mermaid
 graph TD
     subgraph Client [Client Device]
-        Img[Image (JPEG)] -->|HashNet (ONNX)| Hash[128-bit Perceptual Hash]
-        Hash -->|LSQ Quantization| Lattice[Lattice Ring Element R_q]
+        Img["Image (JPEG)"] -->|HashNet ONNX| Hash["128-bit Perceptual Hash"]
+        Hash -->|LSQ Quantization| Lattice["Lattice Ring Element R_q"]
         
         subgraph Crypto Core
-            Lattice -->|Blind w/ Randomness| Blinded[Blinded Element P']
+            Lattice -->|Blind w/ Randomness| Blinded["Blinded Element P'"]
         end
     end
 
     Blinded -->|gRPC: BlindCheckRequest| Server
     
     subgraph Server [Authority Node]
-        Server -->|Sign Blindly| Signature[Blinded Signature S']
-        Server -->|Split Accumulator| Proof[ZK Proof of Database]
+        Server -->|Sign Blindly| Signature["Blinded Signature S'"]
+        Server -->|Split Accumulator| Proof["ZK Proof of Database"]
     end
     
     Signature -->|gRPC: BlindCheckResponse| ClientVerify
     Proof -->|gRPC: BlindCheckResponse| ClientVerify
     
     subgraph ClientVerify [Verification]
-        ClientVerify -->|Verify Proof| ValidDB{Valid Database?}
+        ClientVerify -->|Verify Proof| ValidDB{"Valid Database?"}
         ValidDB -- Yes --> Unblind
         Unblind -->|Unblind Signature| FinalSig
-        FinalSig -->|Check Membership| Result{Match Found?}
+        FinalSig -->|Check Membership| Result{"Match Found?"}
     end
     
     style Client fill:#f9f,stroke:#333
