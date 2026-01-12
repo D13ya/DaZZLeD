@@ -89,6 +89,44 @@ def dhd_loss(hash1: torch.Tensor, hash2: torch.Tensor) -> torch.Tensor:
     return 1.0 - (h1 * h2).sum(dim=1).mean()
 
 
+def hash_contrastive_loss(logits1: torch.Tensor, logits2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    """
+    NT-Xent contrastive loss directly on hash outputs.
+    
+    This is the key loss for per-image perceptual hashing:
+    - Positive pairs: two augmented views of the same image → similar hash
+    - Negative pairs: different images in the batch → different hashes
+    
+    Unlike simclr_loss (which operates on embeddings), this operates on hash logits
+    to ensure discrimination is learned in the hash space itself.
+    """
+    # Convert logits to soft binary hashes (-1 to +1)
+    h1 = torch.tanh(logits1)
+    h2 = torch.tanh(logits2)
+    
+    # Normalize for cosine similarity
+    h1 = F.normalize(h1, dim=1)
+    h2 = F.normalize(h2, dim=1)
+    
+    batch_size = h1.size(0)
+    h = torch.cat([h1, h2], dim=0)
+    
+    # Compute similarity matrix
+    sim = torch.mm(h, h.t()) / temperature
+    
+    # Mask out self-similarity
+    mask = torch.eye(2 * batch_size, device=h.device, dtype=torch.bool)
+    sim = sim.masked_fill(mask, -float("inf"))
+    
+    # Positive pairs: (i, i+batch_size) and (i+batch_size, i)
+    pos = torch.cat([
+        torch.arange(batch_size, 2 * batch_size, device=h.device),
+        torch.arange(0, batch_size, device=h.device),
+    ])
+    
+    return F.cross_entropy(sim, pos)
+
+
 def hadamard_matrix(size: int, device: torch.device) -> torch.Tensor:
     if size <= 0 or (size & (size - 1)) != 0:
         raise ValueError("hash_dim must be power-of-two for Hadamard centers")
@@ -979,6 +1017,11 @@ def train(args):
                         q_loss = quantization_loss(torch.sigmoid(logits1)) if args.quant_weight > 0 else torch.zeros((), device=device)
                     cf_loss = torch.zeros((), device=device)
                     dhd = torch.zeros((), device=device)
+                    # Hash contrastive loss for per-image discrimination
+                    if use_two_view and logits2 is not None and args.hash_contrastive_weight > 0:
+                        hcl = hash_contrastive_loss(logits1, logits2, args.hash_contrastive_temp)
+                    else:
+                        hcl = torch.zeros((), device=device)
                 else:
                     center_loss, distinct_loss = hash_center_losses(
                         logits1, labels, centers, args.center_neg_k, args.center_mode, ghost_centers,
@@ -996,6 +1039,11 @@ def train(args):
                         dhd = dhd_loss(h1, h2)
                     else:
                         dhd = torch.zeros((), device=device)
+                    # Hash contrastive loss for per-image discrimination
+                    if args.hash_contrastive_weight > 0:
+                        hcl = hash_contrastive_loss(logits1, cf_logits, args.hash_contrastive_temp)
+                    else:
+                        hcl = torch.zeros((), device=device)
 
                 base_hash = (
                     args.center_weight * center_loss -
@@ -1024,6 +1072,7 @@ def train(args):
                     base_hash +
                     args.cf_weight * cf_loss +
                     args.dhd_weight * dhd +
+                    args.hash_contrastive_weight * hcl +
                     args.adv_weight * adv_loss
                 )
 
@@ -1050,8 +1099,8 @@ def train(args):
                     f"E{epoch+1} B{batch_idx} U{update_step} "
                     f"tot={total_loss.item():.4f} ctr={center_loss.item():.4f} "
                     f"dst={distinct_loss.item():.4f} q={q_loss.item():.4f} "
-                    f"cf={cf_loss.item():.4f} dhd={dhd.item():.4f} adv={adv_loss.item():.4f} "
-                    f"lr={lr:.2e}"
+                    f"cf={cf_loss.item():.4f} dhd={dhd.item():.4f} hcl={hcl.item():.4f} "
+                    f"adv={adv_loss.item():.4f} lr={lr:.2e}"
                 )
 
             if args.checkpoint_dir and args.checkpoint_every > 0:
@@ -1148,6 +1197,10 @@ def main():
     train_group.add_argument("--cf-weight", type=float, default=1.0)
     train_group.add_argument("--cf-temperature", type=float, default=0.07)
     train_group.add_argument("--dhd-weight", type=float, default=0.5)
+    train_group.add_argument("--hash-contrastive-weight", type=float, default=1.0,
+                            help="Weight for hash-space contrastive loss (per-image discrimination)")
+    train_group.add_argument("--hash-contrastive-temp", type=float, default=0.1,
+                            help="Temperature for hash contrastive loss")
     train_group.add_argument("--adv-weight", type=float, default=0.5)
     train_group.add_argument("--pgd-epsilon", type=float, default=8/255)
     train_group.add_argument("--pgd-alpha", type=float, default=2/255)
