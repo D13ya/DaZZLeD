@@ -45,11 +45,11 @@ graph TD
         Server -->|Split Accumulator| Proof["ZK Proof of Database"]
     end
     
-    Signature -->|gRPC: BlindCheckResponse| ClientVerify
-    Proof -->|gRPC: BlindCheckResponse| ClientVerify
+    Signature -->|gRPC: BlindCheckResponse| ValidDB
+    Proof -->|gRPC: BlindCheckResponse| ValidDB
     
-    subgraph ClientVerify [Verification]
-        ClientVerify -->|Verify Proof| ValidDB{"Valid Database?"}
+    subgraph VerifyGroup [Verification]
+        ValidDB{"Valid Database?"}
         ValidDB -- Yes --> Unblind
         Unblind -->|Unblind Signature| FinalSig
         FinalSig -->|Check Membership| Result{"Match Found?"}
@@ -57,7 +57,7 @@ graph TD
     
     style Client fill:#f9f,stroke:#333
     style Server fill:#bbf,stroke:#333
-    style ClientVerify fill:#efe,stroke:#333
+    style VerifyGroup fill:#efe,stroke:#333
 ```
 
 ---
