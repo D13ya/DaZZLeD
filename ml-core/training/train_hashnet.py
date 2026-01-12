@@ -918,6 +918,19 @@ def train(args):
     if args.grad_checkpoint:
         model.set_grad_checkpointing(True)
         print("Gradient checkpointing enabled (~50% memory savings)")
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        print(f"Resuming from checkpoint: {resume_path}")
+        if resume_path.suffix == ".safetensors":
+            safetensors.torch.load_model(model, str(resume_path))
+        else:
+            state = torch.load(str(resume_path), map_location=device)
+            model.load_state_dict(state)
+        print("Checkpoint loaded successfully")
 
     cf_model = _build_counterfactual_vae(args, dataset, device)
 
@@ -1252,6 +1265,8 @@ def main():
     infra_group.add_argument("--log-interval", type=int, default=50)
     infra_group.add_argument("--checkpoint-dir", default="./checkpoints")
     infra_group.add_argument("--checkpoint-every", type=int, default=0)
+    infra_group.add_argument("--resume", default="",
+                            help="Path to checkpoint to resume training from")
     infra_group.add_argument("--ttc-check", action="store_true", help="Run TTC consistency check after each epoch")
     infra_group.add_argument("--ttc-samples", type=int, default=16)
     infra_group.add_argument("--ttc-views", type=int, default=8)
