@@ -1,16 +1,22 @@
 package bridge
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"sync"
+
+	ort "github.com/yalue/onnxruntime_go"
+	"golang.org/x/image/draw"
 )
 
 const (
 	HashDim        = 128
-	StateDim       = 128
-	DefaultSteps   = 16
 	DefaultImgSize = 224
 )
 
@@ -20,42 +26,40 @@ var (
 	ErrSessionClosed  = errors.New("ONNX session is closed")
 )
 
+// ImageNet normalization constants
+var (
+	imagenetMean = [3]float32{0.485, 0.456, 0.406}
+	imagenetStd  = [3]float32{0.229, 0.224, 0.225}
+)
+
+// onnxInitialized tracks if ONNX runtime environment is initialized
+var onnxInitialized bool
+var onnxInitMu sync.Mutex
+
 // Hasher defines the interface for perceptual hash generation.
-// This allows swapping between placeholder and real ONNX implementations.
 type Hasher interface {
-	// Hash generates a perceptual hash vector from image bytes.
 	Hash(imageData []byte) ([]float32, error)
-	// Close releases any resources held by the hasher.
 	Close() error
 }
 
 // HasherConfig holds configuration for hasher implementations.
 type HasherConfig struct {
-	// ModelPath is the path to the ONNX model file
-	ModelPath string
-	// RecursionSteps is the number of recursive inference passes
-	RecursionSteps int
-	// ImageSize is the expected input image dimension
-	ImageSize int
-	// StateDim is the hidden state dimension
-	StateDim int
-	// HashDim is the output hash dimension
-	HashDim int
+	ModelPath      string
+	ImageSize      int
+	HashDim        int
+	SharedLibPath  string // Path to onnxruntime shared library (optional)
+	UsePlaceholder bool   // If true, skip ONNX and use placeholder (for testing)
 }
 
-// DefaultHasherConfig returns sensible defaults matching the TRM model.
+// DefaultHasherConfig returns sensible defaults matching the ResNetHashNet model.
 func DefaultHasherConfig() HasherConfig {
 	return HasherConfig{
-		RecursionSteps: DefaultSteps,
-		ImageSize:      DefaultImgSize,
-		StateDim:       StateDim,
-		HashDim:        HashDim,
+		ImageSize: DefaultImgSize,
+		HashDim:   HashDim,
 	}
 }
 
 // PlaceholderHasher provides a deterministic hash implementation for testing.
-// WARNING: This does NOT provide security guarantees and must be replaced
-// with ONNXHasher in production.
 type PlaceholderHasher struct {
 	cfg    HasherConfig
 	closed bool
@@ -64,11 +68,11 @@ type PlaceholderHasher struct {
 
 // NewPlaceholderHasher creates a new placeholder hasher.
 func NewPlaceholderHasher(cfg HasherConfig) *PlaceholderHasher {
-	if cfg.RecursionSteps == 0 {
-		cfg.RecursionSteps = DefaultSteps
-	}
 	if cfg.HashDim == 0 {
 		cfg.HashDim = HashDim
+	}
+	if cfg.ImageSize == 0 {
+		cfg.ImageSize = DefaultImgSize
 	}
 	return &PlaceholderHasher{cfg: cfg}
 }
@@ -85,10 +89,9 @@ func (h *PlaceholderHasher) Hash(imageData []byte) ([]float32, error) {
 		return nil, ErrInvalidImage
 	}
 
-	return placeholderHash(imageData, h.cfg.RecursionSteps, h.cfg.HashDim), nil
+	return placeholderHash(imageData, h.cfg.HashDim), nil
 }
 
-// Close marks the hasher as closed.
 func (h *PlaceholderHasher) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -97,19 +100,62 @@ func (h *PlaceholderHasher) Close() error {
 }
 
 // ONNXHasher provides perceptual hashing using ONNX Runtime.
-// This is the production implementation that runs the trained TRM model.
 type ONNXHasher struct {
-	cfg    HasherConfig
-	mu     sync.Mutex
-	closed bool
-	// session will hold the actual onnxruntime-go session
-	// Add this when integrating onnxruntime-go:
-	// session *ort.DynamicAdvancedSession
+	cfg          HasherConfig
+	session      *ort.AdvancedSession
+	inputTensor  *ort.Tensor[float32]
+	outputTensor *ort.Tensor[float32]
+	mu           sync.Mutex
+	closed       bool
+}
+
+// InitONNXEnvironment initializes the ONNX runtime environment.
+// Call this once at application startup with the path to onnxruntime shared library.
+func InitONNXEnvironment(sharedLibPath string) error {
+	onnxInitMu.Lock()
+	defer onnxInitMu.Unlock()
+
+	if onnxInitialized {
+		return nil
+	}
+
+	if sharedLibPath != "" {
+		ort.SetSharedLibraryPath(sharedLibPath)
+	}
+
+	if err := ort.InitializeEnvironment(); err != nil {
+		return fmt.Errorf("init onnx environment: %w", err)
+	}
+
+	onnxInitialized = true
+	return nil
+}
+
+// DestroyONNXEnvironment cleans up the ONNX runtime environment.
+// Call this at application shutdown.
+func DestroyONNXEnvironment() error {
+	onnxInitMu.Lock()
+	defer onnxInitMu.Unlock()
+
+	if !onnxInitialized {
+		return nil
+	}
+
+	if err := ort.DestroyEnvironment(); err != nil {
+		return err
+	}
+
+	onnxInitialized = false
+	return nil
 }
 
 // NewONNXHasher creates a new ONNX-based hasher.
-// Returns an error if the model cannot be loaded.
 func NewONNXHasher(cfg HasherConfig) (*ONNXHasher, error) {
+	if cfg.UsePlaceholder {
+		// Return a wrapper that uses placeholder internally
+		return &ONNXHasher{cfg: cfg, session: nil}, nil
+	}
+
 	if cfg.ModelPath == "" {
 		return nil, errors.New("model path is required")
 	}
@@ -117,38 +163,54 @@ func NewONNXHasher(cfg HasherConfig) (*ONNXHasher, error) {
 		return nil, errors.New("model file not found: " + cfg.ModelPath)
 	}
 
-	if cfg.RecursionSteps == 0 {
-		cfg.RecursionSteps = DefaultSteps
-	}
 	if cfg.HashDim == 0 {
 		cfg.HashDim = HashDim
-	}
-	if cfg.StateDim == 0 {
-		cfg.StateDim = StateDim
 	}
 	if cfg.ImageSize == 0 {
 		cfg.ImageSize = DefaultImgSize
 	}
 
-	h := &ONNXHasher{cfg: cfg}
+	// Ensure ONNX environment is initialized
+	if err := InitONNXEnvironment(cfg.SharedLibPath); err != nil {
+		return nil, err
+	}
 
-	// Initialize ONNX Runtime session
-	// When integrating onnxruntime-go, add:
-	//
-	// ort.SetSharedLibraryPath(libPath)
-	// if err := ort.InitializeEnvironment(); err != nil {
-	//     return nil, fmt.Errorf("init onnx environment: %w", err)
-	// }
-	//
-	// inputNames := []string{"image", "prev_state"}
-	// outputNames := []string{"next_state", "hash"}
-	// session, err := ort.NewDynamicAdvancedSession(cfg.ModelPath, inputNames, outputNames, nil)
-	// if err != nil {
-	//     return nil, fmt.Errorf("load onnx model: %w", err)
-	// }
-	// h.session = session
+	// Create input tensor [1, 3, 224, 224]
+	inputShape := ort.NewShape(1, 3, int64(cfg.ImageSize), int64(cfg.ImageSize))
+	inputTensor, err := ort.NewEmptyTensor[float32](inputShape)
+	if err != nil {
+		return nil, fmt.Errorf("create input tensor: %w", err)
+	}
 
-	return h, nil
+	// Create output tensor [1, 128]
+	outputShape := ort.NewShape(1, int64(cfg.HashDim))
+	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
+	if err != nil {
+		inputTensor.Destroy()
+		return nil, fmt.Errorf("create output tensor: %w", err)
+	}
+
+	// Create session with input and output tensors
+	session, err := ort.NewAdvancedSession(
+		cfg.ModelPath,
+		[]string{"image"},
+		[]string{"hash"},
+		[]ort.ArbitraryTensor{inputTensor},
+		[]ort.ArbitraryTensor{outputTensor},
+		nil, // Use default options
+	)
+	if err != nil {
+		inputTensor.Destroy()
+		outputTensor.Destroy()
+		return nil, fmt.Errorf("create onnx session: %w", err)
+	}
+
+	return &ONNXHasher{
+		cfg:          cfg,
+		session:      session,
+		inputTensor:  inputTensor,
+		outputTensor: outputTensor,
+	}, nil
 }
 
 // Hash generates a perceptual hash using the ONNX model.
@@ -163,79 +225,32 @@ func (h *ONNXHasher) Hash(imageData []byte) ([]float32, error) {
 		return nil, ErrInvalidImage
 	}
 
+	// Use placeholder if no session
+	if h.session == nil {
+		return placeholderHash(imageData, h.cfg.HashDim), nil
+	}
+
 	// Preprocess image to tensor
 	imageTensor, err := preprocessImage(imageData, h.cfg.ImageSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// Run recursive inference
-	hash, err := h.runRecursiveInference(imageTensor)
-	if err != nil {
-		return nil, err
+	// Copy preprocessed image data into input tensor
+	inputData := h.inputTensor.GetData()
+	copy(inputData, imageTensor)
+
+	// Run inference
+	if err := h.session.Run(); err != nil {
+		return nil, fmt.Errorf("inference failed: %w", err)
 	}
 
-	return hash, nil
-}
+	// Copy output from output tensor
+	outputData := h.outputTensor.GetData()
+	result := make([]float32, h.cfg.HashDim)
+	copy(result, outputData)
 
-// runRecursiveInference executes the TRM model for cfg.RecursionSteps iterations.
-func (h *ONNXHasher) runRecursiveInference(imageTensor []float32) ([]float32, error) {
-	// Initialize state to zeros
-	state := make([]float32, h.cfg.StateDim)
-	var hash []float32
-
-	for step := 0; step < h.cfg.RecursionSteps; step++ {
-		// When integrating onnxruntime-go, replace with:
-		//
-		// imageTensorORT, _ := ort.NewTensor(ort.NewShape(1, 3, h.cfg.ImageSize, h.cfg.ImageSize), imageTensor)
-		// stateTensorORT, _ := ort.NewTensor(ort.NewShape(1, h.cfg.StateDim), state)
-		// defer imageTensorORT.Destroy()
-		// defer stateTensorORT.Destroy()
-		//
-		// outputs, err := h.session.Run([]ort.ArbitraryTensor{imageTensorORT, stateTensorORT})
-		// if err != nil {
-		//     return nil, fmt.Errorf("inference step %d: %w", step, err)
-		// }
-		//
-		// state = outputs[0].GetData().([]float32)
-		// hash = outputs[1].GetData().([]float32)
-
-		// Placeholder: use deterministic simulation
-		state, hash = simulateInferenceStep(imageTensor, state, step, h.cfg.HashDim)
-	}
-
-	return hash, nil
-}
-
-// simulateInferenceStep provides a deterministic placeholder for a single TRM step.
-func simulateInferenceStep(image, state []float32, step, hashDim int) ([]float32, []float32) {
-	// Combine image features with state
-	combined := make([]byte, len(image)*4+len(state)*4+1)
-	offset := 0
-	for _, v := range image[:min(len(image), 64)] { // Use subset for speed
-		combined[offset] = byte(int(v*127) & 0xFF)
-		offset++
-	}
-	for _, v := range state {
-		combined[offset] = byte(int(v*127) & 0xFF)
-		offset++
-	}
-	combined[offset] = byte(step)
-
-	// Generate new state and hash
-	sum := sha256.Sum256(combined)
-
-	newState := make([]float32, len(state))
-	for i := range newState {
-		newState[i] = (float32(sum[i%len(sum)]) / 127.5) - 1.0
-	}
-
-	hash := make([]float32, hashDim)
-	for i := range hash {
-		hash[i] = float32(sum[(i+16)%len(sum)]) / 255.0
-	}
-
-	return newState, hash
+	return result, nil
 }
 
 // Close releases ONNX runtime resources.
@@ -248,64 +263,99 @@ func (h *ONNXHasher) Close() error {
 	}
 	h.closed = true
 
-	// When integrating onnxruntime-go:
-	// if h.session != nil {
-	//     h.session.Destroy()
-	// }
-	// ort.DestroyEnvironment()
+	var errs []error
 
+	if h.session != nil {
+		if err := h.session.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if h.inputTensor != nil {
+		if err := h.inputTensor.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if h.outputTensor != nil {
+		if err := h.outputTensor.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return errs[0]
+	}
 	return nil
 }
 
-// preprocessImage decodes and normalizes image data for the model.
+// preprocessImage decodes, resizes, and normalizes image data for the model.
 func preprocessImage(data []byte, targetSize int) ([]float32, error) {
 	if len(data) == 0 {
 		return nil, ErrInvalidImage
 	}
 
-	// Full implementation requires image decoding library.
-	// When integrating, use:
-	// - "image" package for decoding
-	// - "golang.org/x/image/draw" for resizing
-	// - Apply ImageNet normalization: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return preprocessImageFallback(data, targetSize), nil
+	}
 
-	// Placeholder: generate tensor from raw bytes
+	resized := image.NewRGBA(image.Rect(0, 0, targetSize, targetSize))
+	draw.BiLinear.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Over, nil)
+
 	tensorSize := 3 * targetSize * targetSize
 	tensor := make([]float32, tensorSize)
 
-	// Use image bytes to seed deterministic values
-	sum := sha256.Sum256(data)
-	for i := range tensor {
-		tensor[i] = (float32(sum[i%len(sum)]) / 127.5) - 1.0
+	for y := 0; y < targetSize; y++ {
+		for x := 0; x < targetSize; x++ {
+			r, g, b, _ := resized.At(x, y).RGBA()
+			rNorm := (float32(r>>8)/255.0 - imagenetMean[0]) / imagenetStd[0]
+			gNorm := (float32(g>>8)/255.0 - imagenetMean[1]) / imagenetStd[1]
+			bNorm := (float32(b>>8)/255.0 - imagenetMean[2]) / imagenetStd[2]
+
+			tensor[0*targetSize*targetSize+y*targetSize+x] = rNorm
+			tensor[1*targetSize*targetSize+y*targetSize+x] = gNorm
+			tensor[2*targetSize*targetSize+y*targetSize+x] = bNorm
+		}
 	}
 
 	return tensor, nil
 }
 
-// normalizeL2 applies L2 normalization to a vector.
-func normalizeL2(v []float32) []float32 {
-	var norm float32
-	for _, x := range v {
-		norm += x * x
+func preprocessImageFallback(data []byte, targetSize int) []float32 {
+	tensorSize := 3 * targetSize * targetSize
+	tensor := make([]float32, tensorSize)
+	sum := sha256.Sum256(data)
+	for i := range tensor {
+		tensor[i] = (float32(sum[i%len(sum)]) / 127.5) - 1.0
 	}
-	if norm > 0 {
-		invNorm := 1.0 / sqrt32(norm)
-		for i := range v {
-			v[i] *= invNorm
-		}
-	}
-	return v
+	return tensor
 }
 
-func sqrt32(x float32) float32 {
-	if x <= 0 {
-		return 0
+// BinarizeHashToBytes converts soft hash to compact binary hash.
+func BinarizeHashToBytes(softHash []float32) []byte {
+	numBytes := (len(softHash) + 7) / 8
+	binary := make([]byte, numBytes)
+	for i, v := range softHash {
+		if v > 0.5 {
+			binary[i/8] |= 1 << (7 - uint(i%8))
+		}
 	}
-	z := x
-	for i := 0; i < 10; i++ {
-		z = (z + x/z) / 2
+	return binary
+}
+
+// HammingDistance computes the Hamming distance between two binary hashes.
+func HammingDistance(a, b []byte) int {
+	if len(a) != len(b) {
+		return -1
 	}
-	return z
+	dist := 0
+	for i := range a {
+		xor := a[i] ^ b[i]
+		for xor != 0 {
+			dist += int(xor & 1)
+			xor >>= 1
+		}
+	}
+	return dist
 }
 
 func min(a, b int) int {
@@ -317,7 +367,6 @@ func min(a, b int) int {
 
 // --- Legacy API for backward compatibility ---
 
-// LoadImage reads raw bytes from disk.
 func LoadImage(path string) ([]byte, error) {
 	if path == "" {
 		return nil, errors.New("image path is required")
@@ -332,27 +381,15 @@ func LoadImage(path string) ([]byte, error) {
 	return data, nil
 }
 
-// RecursiveInference is the legacy API. Use Hasher interface for new code.
-func RecursiveInference(image []byte, steps int) []float32 {
-	if steps <= 0 {
-		steps = DefaultSteps
-	}
-	return placeholderHash(image, steps, HashDim)
-}
-
-// placeholderHash generates a deterministic sigmoid-like hash in [0,1] for testing.
-func placeholderHash(image []byte, steps, hashDim int) []float32 {
-	state := sha256.Sum256(image)
-	for i := 0; i < steps; i++ {
-		combined := append(state[:], byte(i))
-		state = sha256.Sum256(combined)
-	}
-
+func placeholderHash(imageData []byte, hashDim int) []float32 {
+	sum := sha256.Sum256(imageData)
 	out := make([]float32, hashDim)
 	for i := range out {
-		b := state[i%len(state)]
-		out[i] = float32(b) / 255.0
+		out[i] = float32(sum[i%len(sum)]) / 255.0
 	}
-
 	return out
+}
+
+func RecursiveInference(image []byte, steps int) []float32 {
+	return placeholderHash(image, HashDim)
 }

@@ -25,9 +25,14 @@ scannerwork/
 
 .literature/
 literature/
+. ml-core/hashnet_perimage_test/
+ml-core/hashnet_perimage_test/
+
 
 ..vscode/
 .vscode/
+..idea/
+.idea/
 
 # Git ignore file (note: if already tracked, you'll need to untrack it once)
 .gitignore
@@ -65,3 +70,5 @@ keys/
 ml-core/image/logic/
 .vscode/settings.json
 .vscode/settings.json
+.idea/copilot.data.migration.agent.xml
+ml-core/hashnet_perimage_test/hashnet.onnx
