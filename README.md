@@ -44,11 +44,11 @@ graph TD
         end
     end
 
-    Blinded -->|gRPC: BlindCheckRequest| Server
+    Blinded -->|gRPC: BlindCheckRequest| ServerNode
     
     subgraph Server [Authority Node]
-        Server -->|Sign Blindly| Signature["Blinded Signature S'"]
-        Server -->|Sign Bloom Filter| Proof["Signed Set Commitment"]
+        ServerNode["Server Process"] -->|Sign Blindly| Signature["Blinded Signature S'"]
+        ServerNode -->|Sign Bloom Filter| Proof["Signed Set Commitment"]
     end
     
     Signature -->|gRPC: BlindCheckResponse| ValidDB
