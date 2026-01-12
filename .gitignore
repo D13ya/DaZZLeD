@@ -60,3 +60,5 @@ keys/
 
 # Ignore user-generated figures and logic images
 ml-core/image/logic/
+.vscode/settings.json
+.vscode/settings.json
