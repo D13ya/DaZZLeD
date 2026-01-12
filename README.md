@@ -38,11 +38,11 @@ graph TD
         end
     end
 
-    Blinded -->|gRPC: BlindCheckRequest| Server
+    Blinded -->|gRPC: BlindCheckRequest| ServerNode
     
     subgraph Server [Authority Node]
-        Server -->|Sign Blindly| Signature["Blinded Signature S'"]
-        Server -->|Split Accumulator| Proof["ZK Proof of Database"]
+        ServerNode["Server Process"] -->|Sign Blindly| Signature["Blinded Signature S'"]
+        ServerNode -->|Split Accumulator| Proof["ZK Proof of Database"]
     end
     
     Signature -->|gRPC: BlindCheckResponse| ValidDB
