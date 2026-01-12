@@ -607,8 +607,14 @@ def _create_dataloader(args, use_two_view: bool):
 
 
 def _validate_labels(args, dataset: FlatImageDataset) -> None:
+    # Allow self-supervised mode with only CF/DHD losses
     if args.center_weight <= 0 and args.distinct_weight <= 0:
-        raise ValueError("Center mode requires --center-weight > 0 or --distinct-weight > 0")
+        if args.cf_weight <= 0 and args.dhd_weight <= 0:
+            raise ValueError(
+                "No training objective specified. Use --center-weight/--distinct-weight "
+                "for label-based training, or --cf-weight/--dhd-weight for self-supervised training."
+            )
+        return  # Self-supervised mode, no label validation needed
     if args.label_mode != "none" and (args.center_weight > 0 or args.distinct_weight > 0):
         if dataset.num_classes < 2:
             raise ValueError(
