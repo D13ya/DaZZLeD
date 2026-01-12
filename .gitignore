@@ -26,6 +26,9 @@ scannerwork/
 .literature/
 literature/
 
+..vscode/
+.vscode/
+
 # Git ignore file (note: if already tracked, you'll need to untrack it once)
 .gitignore
 
