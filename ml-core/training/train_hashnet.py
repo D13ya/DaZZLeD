@@ -1123,7 +1123,8 @@ def main():
 
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--backbone", choices=["resnet18", "resnet50"], default="resnet50")
-    model_group.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights")
+    model_group.add_argument("--no-pretrained", dest="pretrained", action="store_false", help="Train from scratch (default: use pretrained)")
+    model_group.set_defaults(pretrained=True)
     model_group.add_argument("--hash-dim", type=int, default=128)
     model_group.add_argument("--proj-dim", type=int, default=512)
     model_group.add_argument("--image-size", type=int, default=224)
