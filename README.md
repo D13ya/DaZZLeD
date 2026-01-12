@@ -34,36 +34,41 @@ We address specific weaknesses in the original design using modern techniques:
 ## **🏗 Architecture**
 
 ```mermaid
-graph TD
+graph LR
     subgraph Client [Client Device]
-        Img["Image (JPEG)"] -->|HashNet ONNX| Hash["128-bit Perceptual Hash"]
-        Hash -->|LSQ Quantization| Lattice["Lattice Ring Element R_q"]
-        
-        subgraph Crypto Core
-            Lattice -->|Blind w/ Randomness| Blinded["Blinded Element P'"]
-        end
+        direction TB
+        Img(Image) --> Model(HashNet)
+        Model --> Hash(128-bit Hash) --> Lat(Lattice R_q)
+        Lat --> Blind(Blinded P')
     end
 
-    Blinded -->|gRPC: BlindCheckRequest| ServerNode
-    
+    Blind -->|gRPC Req| Srv
+
     subgraph Server [Authority Node]
-        ServerNode["Server Process"] -->|Sign Blindly| Signature["Blinded Signature S'"]
-        ServerNode -->|Sign Bloom Filter| Proof["Signed Set Commitment"]
+        direction TB
+        Srv(Server Process)
+        Srv -->|Sign| Sig(Blinded Sig S')
+        Srv -->|Proof| Proof(Commitment)
     end
-    
-    Signature -->|gRPC: BlindCheckResponse| ValidDB
-    Proof -->|gRPC: BlindCheckResponse| ValidDB
-    
-    subgraph VerifyGroup [Verification]
-        ValidDB{"Valid Commitment?"}
-        ValidDB -- Yes --> Unblind
-        Unblind -->|Unblind Signature| FinalSig
-        FinalSig -->|Check Membership| Result{"Match Found?"}
+
+    Sig & Proof -->|gRPC Resp| Verif
+
+    subgraph Check [Verification]
+        direction TB
+        Verif{Valid DB?}
+        Verif -->|Yes| Unblind(Unblind Sig) --> Match{Match?}
     end
+
+    %% Styling for a polished look
+    classDef plain fill:#fff,stroke:#333,stroke-width:1px;
+    classDef node fill:#ececff,stroke:#555,stroke-width:1px;
     
-    style Client fill:#f9f,stroke:#333
-    style Server fill:#bbf,stroke:#333
-    style VerifyGroup fill:#efe,stroke:#333
+    class Img,Model,Hash,Lat,Blind,Srv,Sig,Proof,Unblind plain
+    class Verif,Match node
+    
+    style Client fill:#ffeefc,stroke:#d470a2
+    style Server fill:#e6f0ff,stroke:#4d88ff
+    style Check fill:#e8ffe8,stroke:#4caf50
 ```
 
 ---
