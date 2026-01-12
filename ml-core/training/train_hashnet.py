@@ -402,11 +402,22 @@ class FlatImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        if self.cache_ram:
-            img = self.images[idx]
-        else:
-            img = Image.open(self.paths[idx]).convert("RGB")
-        return self.transform(img), self.labels[idx], self.domain_ids[idx]
+        try:
+            if self.cache_ram:
+                img = self.images[idx]
+            else:
+                img = Image.open(self.paths[idx]).convert("RGB")
+            return self.transform(img), self.labels[idx], self.domain_ids[idx]
+        except (OSError, IOError) as e:
+            # Log corrupt/truncated image and retry with random sample
+            print(f"\n⚠️  CORRUPT IMAGE DETECTED: {self.paths[idx]}")
+            print(f"   Error: {e}")
+            print(f"   Skipping and using random replacement...\n")
+            # Return a random different image instead
+            new_idx = random.randint(0, len(self.paths) - 1)
+            if new_idx == idx and len(self.paths) > 1:
+                new_idx = (idx + 1) % len(self.paths)
+            return self.__getitem__(new_idx)
 
 
 class SingleViewTransform:
