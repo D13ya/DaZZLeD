@@ -495,6 +495,7 @@ class TwoViewTransform:
 class ResNetHashNet(nn.Module):
     def __init__(self, backbone: str, hash_dim: int, proj_dim: int, pretrained: bool):
         super().__init__()
+        self._grad_checkpointing = False
         backbone = backbone.lower()
         if backbone == "resnet18":
             if pretrained:
@@ -532,6 +533,10 @@ class ResNetHashNet(nn.Module):
         self.hash_head = nn.Linear(proj_dim, hash_dim)
         self._init_heads()
 
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable gradient checkpointing to reduce memory usage (~50% savings)."""
+        self._grad_checkpointing = enable
+
     def _init_heads(self) -> None:
         for module in self.proj:
             if isinstance(module, nn.Linear):
@@ -545,8 +550,14 @@ class ResNetHashNet(nn.Module):
         if self.hash_head.bias is not None:
             nn.init.zeros_(self.hash_head.bias)
 
+    def _encoder_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
     def forward(self, x: torch.Tensor, return_proj: bool = False):
-        x = self.encoder(x)
+        if self._grad_checkpointing and self.training:
+            x = torch.utils.checkpoint.checkpoint(self._encoder_forward, x, use_reentrant=False)
+        else:
+            x = self.encoder(x)
         x = torch.flatten(x, 1)
         z = self.proj(x)
         logits = self.hash_head(z)
@@ -904,6 +915,9 @@ def train(args):
     model = build_backbone(args.backbone, args.hash_dim, args.proj_dim, args.pretrained).to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
+    if args.grad_checkpoint:
+        model.set_grad_checkpointing(True)
+        print("Gradient checkpointing enabled (~50% memory savings)")
 
     cf_model = _build_counterfactual_vae(args, dataset, device)
 
@@ -1227,6 +1241,8 @@ def main():
     infra_group = parser.add_argument_group("Infrastructure")
     infra_group.add_argument("--device", default="cuda")
     infra_group.add_argument("--amp", action="store_true")
+    infra_group.add_argument("--grad-checkpoint", action="store_true",
+                            help="Enable gradient checkpointing for ~50%% memory savings")
     infra_group.add_argument("--channels-last", action="store_true")
     infra_group.add_argument("--allow-tf32", action="store_true")
     infra_group.add_argument("--cudnn-benchmark", action="store_true")
