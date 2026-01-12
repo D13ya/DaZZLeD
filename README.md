@@ -1,6 +1,6 @@
-# **DaZZLeD: Privacy-Preserving Perceptual Hashing**
+# **DaZZLeD: Privacy-Preserving Content Detection**
 
-### *An Improved Apple NeuralHash with Post-Quantum Cryptography*
+### *A Clean-Room Implementation of Apple's PSI Protocol with Post-Quantum Improvements*
 
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://golang.org)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python)](https://python.org)
@@ -9,19 +9,25 @@
 
 ---
 
-## **🎯 What This Project Does**
+## **🎯 Overview**
 
-DaZZLeD is a **privacy-preserving content detection system** that generates perceptual hashes of images without exposing the images themselves. It's an improved implementation inspired by [Apple's CSAM Detection](https://www.apple.com/child-safety/pdf/CSAM_Detection_Technical_Summary.pdf), addressing its fundamental security and trust issues.
+DaZZLeD is a research project that **reconstructs and improves** upon the [Apple CSAM Detection Protocol](https://www.apple.com/child-safety/pdf/CSAM_Detection_Technical_Summary.pdf).
 
-### **Key Features**
+It implements the core "Sandwich" privacy architecture:
+1.  **Client-Side AI:** Perceptual hashing to detect content.
+2.  **Blind PSI:** Checking hashes against a server without revealing user data.
 
-| Feature | Apple NeuralHash | DaZZLeD |
-|---------|------------------|---------|
-| **Hash Robustness** | Vulnerable to collision attacks | Contrastive learning + adversarial training |
-| **Per-Image Discrimination** | Domain-level hashing | True per-image unique hashes via NT-Xent loss |
-| **Trust Model** | Blind trust in server | Zero-knowledge proofs (Split Accumulation) |
-| **Cryptography** | Pre-quantum (ECC) | Post-quantum (ML-DSA / Module-Lattices) |
-| **Runtime** | iOS CoreML only | Cross-platform ONNX Runtime |
+### **Our Improvements**
+We address specific weaknesses in the original design using modern techniques:
+
+| Feature | Apple NeuralHash (Original) | DaZZLeD (This Project) |
+|---------|-----------------------------|------------------------|
+| **Hash Robustness** | Vulnerable to collision attacks | **ResNetHashNet:** Contrastive learning + adversarial training for robust per-image hashing. |
+| **Cryptography** | Elliptic Curve PSI (Pre-Quantum) | **Lattice PSI:** Post-Quantum ML-DSA + OPRF (Module-Lattices). |
+| **Auditability** | Opaque Database | **Signed Commitment:** The server signs the database state (Bloom Filter) to prevent split-view attacks. |
+| **Runtime** | iOS CoreML only | Cross-platform ONNX Runtime (Windows/Linux/Mac). |
+
+> **⚠️ Note on Database:** This is a **clean-room implementation**. We do NOT possess or distribute real CSAM hashes. The system is designed to verify the *protocol*, and users must ingest their own dummy hashes for testing.
 
 ---
 
@@ -38,18 +44,18 @@ graph TD
         end
     end
 
-    Blinded -->|gRPC: BlindCheckRequest| ServerNode
+    Blinded -->|gRPC: BlindCheckRequest| Server
     
     subgraph Server [Authority Node]
-        ServerNode["Server Process"] -->|Sign Blindly| Signature["Blinded Signature S'"]
-        ServerNode -->|Split Accumulator| Proof["ZK Proof of Database"]
+        Server -->|Sign Blindly| Signature["Blinded Signature S'"]
+        Server -->|Sign Bloom Filter| Proof["Signed Set Commitment"]
     end
     
     Signature -->|gRPC: BlindCheckResponse| ValidDB
     Proof -->|gRPC: BlindCheckResponse| ValidDB
     
     subgraph VerifyGroup [Verification]
-        ValidDB{"Valid Database?"}
+        ValidDB{"Valid Commitment?"}
         ValidDB -- Yes --> Unblind
         Unblind -->|Unblind Signature| FinalSig
         FinalSig -->|Check Membership| Result{"Match Found?"}
